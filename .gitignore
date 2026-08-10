@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.coverage
+.venv/
+venv/
+data/
+csv_bank/
+*.log
+.DS_Store

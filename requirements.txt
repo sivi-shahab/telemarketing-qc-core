@@ -1,0 +1,9 @@
+# Dependensi kode bersama (db, compliance, services, prompt, sales_lookup).
+# API dan worker meng-install file ini LEBIH DULU, baru requirements-nya sendiri.
+sqlalchemy
+psycopg2-binary
+minio
+openpyxl
+pdfplumber
+requests>=2.31
+pydantic-settings
