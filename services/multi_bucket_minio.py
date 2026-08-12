@@ -93,10 +93,9 @@ _BUCKET_CREDENTIAL_FIELDS = (
     ("minio_bucket_documents", "minio_access_key_documents", "minio_secret_key_documents"),
     ("minio_bucket_audio", "minio_access_key_audio", "minio_secret_key_audio"),
     ("minio_bucket_sales_database", "minio_access_key_sales_database", "minio_secret_key_sales_database"),
-    # qc-database belum punya kredensial sendiri di CDN -- didaftarkan supaya
-    # ketiadaannya muncul sebagai warning yang jelas, bukan bucket yang hilang
-    # diam-diam dari mapping.
-    ("minio_bucket_qc_database", "minio_access_key_qc_database", "minio_secret_key_qc_database"),
+    # qc-database dinonaktifkan: setting minio_bucket_qc_database di-comment,
+    # jadi bucket ini tidak ikut dipetakan sama sekali.
+    # ("minio_bucket_qc_database", "minio_access_key_qc_database", "minio_secret_key_qc_database"),
 )
 
 
