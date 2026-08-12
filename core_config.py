@@ -13,8 +13,9 @@ berisiko bentrok dengan modul lain di root.
 """
 from functools import lru_cache
 
-from minio import Minio
 from pydantic_settings import BaseSettings
+
+from services.multi_bucket_minio import build_minio_client
 
 
 class CoreSettings(BaseSettings):
@@ -27,6 +28,10 @@ class CoreSettings(BaseSettings):
     # supaya deployment lewat CDN/https tidak perlu ubah kode.
     minio_secure: bool = False
     minio_bucket_sales_database: str = "sales-database"
+    # Kredensial khusus bucket sales-database (deployment CDN). Kalau kosong,
+    # build_minio_client() jatuh ke minio_access_key/minio_secret_key di atas.
+    minio_access_key_sales_database: str = ""
+    minio_secret_key_sales_database: str = ""
 
     class Config:
         env_file = ".env"
@@ -39,18 +44,16 @@ def get_core_settings() -> CoreSettings:
     return CoreSettings()
 
 
-_minio_client: Minio = None
+_minio_client = None
 
 
-def get_minio() -> Minio:
-    """MinIO client milik core (lazy, satu instance per proses)."""
+def get_minio():
+    """MinIO client milik core (lazy, satu instance per proses).
+
+    Bisa berupa ``Minio`` biasa atau ``MultiBucketMinioClient`` — keduanya
+    dipakai dengan cara yang sama, lihat ``build_minio_client()``.
+    """
     global _minio_client
     if _minio_client is None:
-        settings = get_core_settings()
-        _minio_client = Minio(
-            settings.minio_endpoint,
-            access_key=settings.minio_access_key,
-            secret_key=settings.minio_secret_key,
-            secure=settings.minio_secure,
-        )
+        _minio_client = build_minio_client(get_core_settings())
     return _minio_client

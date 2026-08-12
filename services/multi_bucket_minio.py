@@ -30,6 +30,15 @@ class MultiBucketMinioClient:
     def __init__(self, bucket_clients: Dict[str, Minio]):
         self._clients = bucket_clients
 
+    def is_configured(self) -> bool:
+        """True kalau minimal SATU bucket punya kredensial sendiri.
+
+        Dipakai ``build_minio_client()`` untuk memutuskan mode: kalau belum ada
+        satu pun (deployment lokal yang masih pakai admin key global), wrapper
+        ini tidak berguna dan client Minio tunggal yang dipakai.
+        """
+        return bool(self._clients)
+
     def _client_for(self, bucket_name: str) -> Minio:
         client = self._clients.get(bucket_name)
         if client is None:
@@ -47,6 +56,9 @@ class MultiBucketMinioClient:
 
     def get_object(self, bucket_name: str, *args, **kwargs):
         return self._client_for(bucket_name).get_object(bucket_name, *args, **kwargs)
+
+    def fget_object(self, bucket_name: str, *args, **kwargs):
+        return self._client_for(bucket_name).fget_object(bucket_name, *args, **kwargs)
 
     def copy_object(self, bucket_name: str, *args, **kwargs):
         # Catatan: CopySource(bucket_asal, key_asal) dianggap bucket_asal SAMA
@@ -72,6 +84,30 @@ class MultiBucketMinioClient:
         return self._client_for(bucket_name).stat_object(bucket_name, *args, **kwargs)
 
 
+# Urutan field di Settings: (nama bucket, access key, secret key). Bucket yang
+# field-nya tidak ada di Settings aplikasi ybs dilewati (lihat getattr di bawah).
+_BUCKET_CREDENTIAL_FIELDS = (
+    ("minio_bucket_transcripts", "minio_access_key_transcripts", "minio_secret_key_transcripts"),
+    ("minio_bucket_results", "minio_access_key_results", "minio_secret_key_results"),
+    ("minio_bucket_campaigns", "minio_access_key_campaigns", "minio_secret_key_campaigns"),
+    ("minio_bucket_documents", "minio_access_key_documents", "minio_secret_key_documents"),
+    ("minio_bucket_audio", "minio_access_key_audio", "minio_secret_key_audio"),
+    ("minio_bucket_sales_database", "minio_access_key_sales_database", "minio_secret_key_sales_database"),
+    # qc-database belum punya kredensial sendiri di CDN -- didaftarkan supaya
+    # ketiadaannya muncul sebagai warning yang jelas, bukan bucket yang hilang
+    # diam-diam dari mapping.
+    ("minio_bucket_qc_database", "minio_access_key_qc_database", "minio_secret_key_qc_database"),
+)
+
+
+def _has_per_bucket_credentials(settings) -> bool:
+    """True kalau ada MINIO_ACCESS_KEY_<BUCKET> + secret-nya yang terisi."""
+    return any(
+        getattr(settings, access_key_field, "") and getattr(settings, secret_key_field, "")
+        for _, access_key_field, secret_key_field in _BUCKET_CREDENTIAL_FIELDS
+    )
+
+
 def build_multi_bucket_client(settings) -> MultiBucketMinioClient:
     """[NEW] Bangun MultiBucketMinioClient dari Settings -- 1 client Minio
     per bucket, masing-masing pakai access_key/secret_key sendiri, semua
@@ -83,26 +119,18 @@ def build_multi_bucket_client(settings) -> MultiBucketMinioClient:
     bertahap), tapi pemakaian bucket itu nanti akan error jelas (lewat
     _client_for() di atas), bukan diam-diam pakai kredensial salah.
     """
-    bucket_credential_map = {
-        settings.minio_bucket_transcripts: (
-            settings.minio_access_key_transcripts, settings.minio_secret_key_transcripts,
-        ),
-        settings.minio_bucket_results: (
-            settings.minio_access_key_results, settings.minio_secret_key_results,
-        ),
-        settings.minio_bucket_campaigns: (
-            settings.minio_access_key_campaigns, settings.minio_secret_key_campaigns,
-        ),
-        settings.minio_bucket_documents: (
-            settings.minio_access_key_documents, settings.minio_secret_key_documents,
-        ),
-        settings.minio_bucket_audio: (
-            settings.minio_access_key_audio, settings.minio_secret_key_audio,
-        ),
-        settings.minio_bucket_sales_database: (
-            settings.minio_access_key_sales_database, settings.minio_secret_key_sales_database,
-        ),
-    }
+    bucket_credential_map: Dict[str, tuple] = {}
+    for bucket_field, access_key_field, secret_key_field in _BUCKET_CREDENTIAL_FIELDS:
+        # getattr, BUKAN akses langsung: tiap aplikasi punya Settings sendiri
+        # (API lengkap, worker lebih sedikit, core cuma sales-database) dan
+        # bucket yang tidak dikenal Settings itu memang tidak dipakai di sana.
+        bucket_name = getattr(settings, bucket_field, "")
+        if not bucket_name:
+            continue
+        bucket_credential_map[bucket_name] = (
+            getattr(settings, access_key_field, ""),
+            getattr(settings, secret_key_field, ""),
+        )
 
     bucket_clients: Dict[str, Minio] = {}
     for bucket_name, (access_key, secret_key) in bucket_credential_map.items():
@@ -117,11 +145,43 @@ def build_multi_bucket_client(settings) -> MultiBucketMinioClient:
             settings.minio_endpoint,
             access_key=access_key,
             secret_key=secret_key,
-            secure=settings.minio_secure,
+            secure=getattr(settings, "minio_secure", False),
         )
         logger.info(
             "[multi-bucket-minio] Bucket '%s' -> access_key='%s' @ %s (secure=%s)",
-            bucket_name, access_key, settings.minio_endpoint, settings.minio_secure,
+            bucket_name, access_key, settings.minio_endpoint,
+            getattr(settings, "minio_secure", False),
         )
 
     return MultiBucketMinioClient(bucket_clients)
+
+
+def build_minio_client(settings):
+    """[NEW] Satu-satunya cara API/worker/core bikin client MinIO.
+
+    Mengembalikan ``MultiBucketMinioClient`` kalau .env sudah mengisi kredensial
+    per-bucket (deployment CDN), dan client ``Minio`` tunggal pakai
+    ``minio_access_key``/``minio_secret_key`` kalau belum (deployment docker
+    lokal). Keduanya punya API yang sama, jadi pemanggilnya tidak perlu tahu
+    sedang di mode yang mana.
+    """
+    secure = getattr(settings, "minio_secure", False)
+
+    # Cek dulu SEBELUM build: kalau memang belum ada kredensial per-bucket sama
+    # sekali (deployment lokal), build_multi_bucket_client() cuma akan mencetak
+    # satu warning per bucket yang tidak relevan di mode itu.
+    if _has_per_bucket_credentials(settings):
+        multi = build_multi_bucket_client(settings)
+        if multi.is_configured():
+            return multi
+
+    logger.info(
+        "[minio] Belum ada kredensial per-bucket -- pakai satu client global "
+        "@ %s (secure=%s).", settings.minio_endpoint, secure,
+    )
+    return Minio(
+        settings.minio_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+        secure=secure,
+    )

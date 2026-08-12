@@ -12,3 +12,4 @@ data/
 csv_bank/
 *.log
 .DS_Store
+.env.bak.20260812
