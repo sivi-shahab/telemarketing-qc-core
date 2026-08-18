@@ -9,6 +9,12 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
 
+
+# [FIX] ``AscendCustp`` dan ``TmsCashline`` DIHAPUS dari daftar import: kedua tabel
+# lokal itu sudah tidak diisi lagi sejak reference data pindah ke DWH API, dan
+# seluruh pemakaiannya di file ini sudah dialihkan (lihat ``tms_submit_time_map``
+# dan filter tanggal di ``list_results``). Definisi modelnya tetap ada di
+# db/models.py sebagai skema tabel.
 from db.models import (
     Campaign,
     Document,
@@ -16,6 +22,7 @@ from db.models import (
     QcAssignment,
     QcDatabase,
     QcManualCheck,
+    QcStatusEvent,
     QcStatusRequest,
     Result,
     ResultData,
@@ -203,6 +210,7 @@ def update_result_status(
     db.refresh(result)
     return result
 
+
 def result_json_map(db: Session, result_ids: list[str]) -> dict:
     """Latest result_json per result_id, in one batched query (no N+1).
     Mirrors the snapshot builder: rows come back newest-first, so the first seen
@@ -239,10 +247,18 @@ def get_result_data(db: Session, result_id: str) -> Optional[ResultData]:
     )
 
 
+# JSONB path ke submit_time pada snapshot reference_data yang tersimpan di
+# ``result_data.result_json`` (disisipkan worker saat evaluasi — lihat
+# worker/tasks/process_transcript.py). Ini pengganti kolom
+# ``tms_cashline.submit_time`` yang tabelnya sudah tidak diisi lagi.
+_SUBMIT_TIME_JSON = ResultData.result_json["reference_data"]["cashline"]["submit_time"]
+
+
 def list_results(
     db: Session,
     status: Optional[str] = None,
     campaign: Optional[str] = None,
+    campaigns: Optional[list[str]] = None,
     ticket_id: Optional[str] = None,
     page: int = 1,
     limit: int = 20,
@@ -279,6 +295,15 @@ def list_results(
         q = q.filter(Result.status == status)
     if campaign:
         q = q.filter(Result.campaign == campaign)
+    if campaigns is not None:
+        # Pembatasan campaign EFEKTIF (bukan filter pilihan user, lihat
+        # ``api.rbac.effective_campaigns_for``): ``None`` = tanpa pembatasan,
+        # sedangkan list KOSONG = dibatasi ke himpunan kosong sehingga tidak ada
+        # baris yang lolos. Case-insensitive karena nama campaign di ``results``
+        # tersimpan apa adanya saat upload.
+        if not campaigns:
+            return [], 0
+        q = q.filter(func.lower(Result.campaign).in_([c.strip().casefold() for c in campaigns]))
     if ticket_id:
         # The displayed "ID" is the prefix before the first "_" of the first
         # source filename (see stats._customer_id_from_files), so match that
@@ -290,10 +315,36 @@ def list_results(
             func.split_part(Result.source_files[0].astext, "_", 1).in_(customer_ids)
         )
     if date_start is not None or date_end is not None:
-        # Filter by the transcript's chart date: the wall-clock ``generated_at`` when
-        # present (naive/local, used as-is), else the WIB calendar date of
-        # ``uploaded_at`` — same basis as the Statistics chart (_series_date).
+        # Filter by the ticket's ``submit_time`` date (disbursement submission), same
+        # basis as the Statistics stacked chart.
+        #
+        # [FIX] Sumbernya SEKARANG snapshot ``reference_data.cashline.submit_time``
+        # di ``result_data.result_json``, BUKAN tabel ``tms_cashline`` yang sudah
+        # tidak diisi lagi sejak reference data pindah ke DWH API. Subquery lama
+        # tidak pernah error (hanya selalu NULL), jadi filter tanggal diam-diam
+        # jatuh ke generated_at/uploaded_at dan tidak sejalan dengan grafik.
+        #
+        # Tetap subquery berkorelasi ber-LIMIT 1 (bukan LEFT JOIN) supaya satu
+        # Result tidak bisa terduplikasi oleh beberapa baris result_data; diurutkan
+        # created_at desc agar yang terbaca adalah evaluasi TERBARU, konsisten
+        # dengan result_json_map / cashline_agent_index.
+        submit_date_subq = (
+            db.query(
+                func.to_date(func.left(func.trim(_SUBMIT_TIME_JSON.astext), 10), "YYYY-MM-DD")
+            )
+            .filter(ResultData.result_id == Result.id)
+            .filter(
+                func.trim(func.coalesce(_SUBMIT_TIME_JSON.astext, "")).op("~")(
+                    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}"
+                )
+            )
+            .order_by(desc(ResultData.created_at))
+            .limit(1)
+            .correlate(Result)
+            .scalar_subquery()
+        )
         series_date = func.coalesce(
+            submit_date_subq,
             func.date(Result.generated_at),
             func.date(func.timezone("Asia/Jakarta", func.timezone("UTC", Result.uploaded_at))),
         )
@@ -319,6 +370,7 @@ def list_transcripts(
     ai_status: Optional[str] = None,
     page: int = 1,
     limit: int = 20,
+    customer_ids: Optional[list[str]] = None,
     uploaded_by_role: Optional[str] = None,
     exclude_uploaded_by_role: Optional[str] = None,
 ) -> tuple[list[dict], int]:
@@ -330,12 +382,24 @@ def list_transcripts(
     AI Status is derived per Result (not stored), so it is only meaningful for
     completed results — passing it forces ``status="done"`` and filters the results
     in Python before flattening.
+
+    ``customer_ids`` membatasi ke ticket/customer id tertentu — cakupan role, sama
+    artinya dengan parameter senama di ``list_results``: ``None`` = tanpa batas,
+    daftar KOSONG = tidak ada satu pun yang lolos (bukan "tanpa batas").
     """
+    if customer_ids is not None and len(customer_ids) == 0:
+        return [], 0
     ai_filter = ai_status.strip().upper() if isinstance(ai_status, str) else None
     # AI Status is only determinable for done results — override the processing status.
     effective_status = "done" if ai_filter in ("PASS", "FAIL") else status
 
     q = db.query(Result)
+    if customer_ids is not None:
+        # customer_id = prefix sebelum "_" pada source file pertama (sama dengan
+        # list_results, jadi kedua menu menyaring dengan aturan yang sama).
+        q = q.filter(
+            func.split_part(Result.source_files[0].astext, "_", 1).in_(customer_ids)
+        )
     if uploaded_by_role is not None:
         q = q.filter(Result.uploaded_by_role == uploaded_by_role)
     if exclude_uploaded_by_role is not None:
@@ -612,6 +676,30 @@ def customer_ids_for_agent_ids(db: Session, agent_ids) -> list[str]:
     ]
 
 
+def customer_ids_for_campaigns(db: Session, campaigns) -> list[str]:
+    """Customer/ticket id milik campaign tertentu — bentuk DAFTAR dari pembatasan
+    campaign sebuah role, supaya batas itu bisa dipasang di mana pun cakupan sudah
+    dinyatakan sebagai ``customer_ids`` (Results, Transcripts, snapshot Statistics).
+
+    Diambil dari ``results.campaign``, BUKAN dari tag roster: yang ditanya di sini
+    adalah "tiket ini milik campaign apa", dan itu tercatat pada tiketnya sendiri.
+    Daftar campaign kosong => daftar id kosong (tidak ada yang lolos), sejalan dengan
+    ``rbac.effective_campaigns_for`` yang memaknai list kosong sebagai "dibatasi ke
+    tidak ada apa pun".
+    """
+    names = [str(c).strip().casefold() for c in (campaigns or []) if str(c).strip()]
+    if not names:
+        return []
+    prefix = func.split_part(Result.source_files[0].astext, "_", 1)
+    rows = (
+        db.query(prefix)
+        .filter(func.lower(func.trim(Result.campaign)).in_(names))
+        .distinct()
+        .all()
+    )
+    return [r[0] for r in rows if r[0]]
+
+
 def _stats_signature(db: Session) -> str:
     """A cheap fingerprint of everything the Statistics aggregation depends on.
 
@@ -647,7 +735,10 @@ def _stats_signature(db: Session) -> str:
     #     Total Risk / Submission is the Performa Campaign definition ONLY. The
     #     Risk Base columns stay as context.
     # v10: hierarchy nodes also carry risk_system (O) + risk_new (N).
-    version = "v10"
+    # v11: submit_time (tenggat H+2 & sumbu-x grafik) dibaca dari snapshot
+    #      reference_data, bukan tabel tms_cashline yang sudah kosong — angka
+    #      PENDING & hierarki berubah, jadi cache lama harus gugur.
+    version = "v11"
     return (
         f"{version}|{res_count}|{res_up}|{res_done}|{rd_count}|{rd_max}"
         f"|{ap_count}|{ap_rev}|{sales_key}"
@@ -713,27 +804,43 @@ def upsert_campaign(
     prompt_filename: str = None,
     scorecard_filename: str = None,
     kb_filename: str = None,
+    kb_text_raw: str = None,
+    riplay: dict = None,
 ) -> Campaign:
+    """Create or replace a campaign config.
+
+    ``kb_text`` is what the evaluator reads (KB with the RIPLAY overlay applied);
+    ``kb_text_raw`` is the KB exactly as uploaded and defaults to ``kb_text``.
+    ``riplay``, when given, carries the RIPLAY columns
+    (``filename``/``product_name``/``similarity``/``extraction``/``applied``/
+    ``uploaded_at``); omit it to leave any previously stored RIPLAY untouched.
+    """
+    fields = {
+        "prompt_text": prompt_text,
+        "scorecard_text": scorecard_text,
+        "kb_text": kb_text,
+        "kb_text_raw": kb_text_raw if kb_text_raw is not None else kb_text,
+        "prompt_filename": prompt_filename,
+        "scorecard_filename": scorecard_filename,
+        "kb_filename": kb_filename,
+        "is_active": True,
+    }
+    if riplay is not None:
+        fields.update(
+            riplay_filename=riplay.get("filename"),
+            riplay_product_name=riplay.get("product_name"),
+            riplay_similarity=riplay.get("similarity"),
+            riplay_extraction=riplay.get("extraction"),
+            riplay_applied=riplay.get("applied"),
+            riplay_uploaded_at=riplay.get("uploaded_at"),
+        )
+
     campaign = db.query(Campaign).filter(Campaign.name == name).first()
     if campaign:
-        campaign.prompt_text = prompt_text
-        campaign.scorecard_text = scorecard_text
-        campaign.kb_text = kb_text
-        campaign.prompt_filename = prompt_filename
-        campaign.scorecard_filename = scorecard_filename
-        campaign.kb_filename = kb_filename
-        campaign.is_active = True
+        for key, value in fields.items():
+            setattr(campaign, key, value)
     else:
-        campaign = Campaign(
-            name=name,
-            prompt_text=prompt_text,
-            scorecard_text=scorecard_text,
-            kb_text=kb_text,
-            prompt_filename=prompt_filename,
-            scorecard_filename=scorecard_filename,
-            kb_filename=kb_filename,
-            is_active=True,
-        )
+        campaign = Campaign(name=name, **fields)
         db.add(campaign)
     db.commit()
     db.refresh(campaign)
@@ -961,6 +1068,32 @@ def result_ids_with_documents(db: Session, result_ids: list[str]) -> set[str]:
     return {str(row[0]) for row in rows}
 
 
+def document_types_by_result(db: Session, result_ids: list[str]) -> dict[str, set[str]]:
+    """``result_id -> {doc_type, ...}`` already uploaded. Single query.
+
+    Needed by the per-type document requirements (a card-holder similarity band asks
+    for one SPECIFIC document), where "the result has some document" is not enough.
+    """
+    if not result_ids:
+        return {}
+    uuids = [uuid.UUID(str(r)) for r in result_ids]
+    rows = (
+        db.query(Document.result_id, Document.doc_type)
+        .filter(Document.result_id.in_(uuids))
+        .distinct()
+        .all()
+    )
+    out: dict[str, set[str]] = {}
+    for rid, doc_type in rows:
+        out.setdefault(str(rid), set()).add(doc_type)
+    return out
+
+
+def result_document_types(db: Session, result_id: str) -> set[str]:
+    """The document types already uploaded for one result."""
+    return document_types_by_result(db, [result_id]).get(str(result_id), set())
+
+
 def document_upload_times(db: Session, result_ids: list[str]) -> dict[str, datetime]:
     """Return ``{result_id: latest document created_at}`` for the given results.
 
@@ -1045,14 +1178,18 @@ def get_ascend_custp_by_result_id(db: Session, result_id: str) -> Optional[dict]
 
     Sumber: DWH API (dashboard.current_cc_scmcustp), dicocokkan oleh Aplikasi A by
     ``no-ktpkitas``. MENGGANTIKAN ``get_ascend_custp_by_local_name`` lama yang
-    mencari by cust_name. ``db`` diabaikan.
+    mencari by cust_name (fungsi itu sudah dihapus — query tabel ``ascend_custp``
+    yang tidak diisi lagi, dan badannya memanggil ``_row_to_dict`` yang bahkan
+    tidak pernah didefinisikan di modul ini). ``db`` diabaikan.
     """
     return get_campaign_bundle(db, result_id).get("customer")
 
 
-# Change flag -> document types allowed for upload. KK / cover_buku_tabungan are
-# intentionally unmapped (KK/nama-ibu-kandung deferred: no source column yet; cover
-# buku tabungan has no triggering change), so they are never uploadable.
+# TMS change flag -> document types allowed for upload. KK and cover_buku_tabungan
+# have no TMS change that triggers them. KK is instead triggered by the
+# nama_ibu_kandung similarity band (see ``compliance.documents.CARD_HOLDER_DOC_BANDS``),
+# which is unioned onto this list by the callers; cover_buku_tabungan still has no
+# trigger at all.
 CHANGE_DOC_TYPES = {
     "kantor": ["ktp"],
     "rumah": ["ktp"],
@@ -1095,13 +1232,13 @@ def compute_tms_change_flags(cashline_row: Optional[dict]) -> dict:
     Dipakai _build_items() (api/routers/stats.py) untuk result yang SUDAH
     punya reference_data tersimpan di result_json, supaya tidak perlu
     panggil get_tms_cashline_change_flags() (HTTP) lagi tiap ResultsView
-    dibuka. get_tms_cashline_change_flags() (di atas, HTTP per-id) TETAP
+    dibuka. get_tms_cashline_change_flags() (di bawah, HTTP per-id) TETAP
     dipakai sebagai FALLBACK untuk result LAMA yang diproses SEBELUM
     reference_data mulai disisipkan ke result_json.
 
     Logic PERSIS SAMA dengan yang dipakai get_tms_cashline_change_flags()
-    di atas (kolom _KANTOR_NEW_COLS/_RUMAH_NEW_COLS/no-npwp-new/nik-new
-    yang sama) -- cuma menerima dict yang SUDAH ADA, bukan fetch sendiri.
+    (kolom _KANTOR_NEW_COLS/_RUMAH_NEW_COLS/no-npwp-new/nik-new yang sama)
+    -- cuma menerima dict yang SUDAH ADA, bukan fetch sendiri.
     """
     if not cashline_row:
         return {}
@@ -1146,6 +1283,34 @@ def get_tms_cashline_change_flags(db: Session, result_ids: list[str]) -> dict[st
     return out
 
 
+def tms_submit_time_map(db: Session, cids: list[str]) -> dict[str, str]:
+    """Batched map ``cid -> submit_time`` (string mentah, mis. "2026-06-17 15:24:53").
+    Menyuapi timer SLA H+2 di menu Pending Check, yang menghitung sejak waktu
+    pengajuan pencairan.
+
+    [FIX] Sumbernya ``cashline_agent_index()`` — snapshot ``reference_data`` yang
+    tersimpan di ``result_data.result_json`` — BUKAN lagi tabel ``tms_cashline``,
+    yang sudah tidak diisi sejak reference data pindah ke DWH API. Query lama
+    tetap berjalan tanpa error tetapi SELALU mengembalikan peta kosong, sehingga
+    submit_time selalu None dan status PENDING tidak pernah muncul di layar.
+    """
+    ids = [str(x).strip() for x in cids if x]
+    if not ids:
+        return {}
+    index = cashline_agent_index(db)
+    out: dict[str, str] = {}
+    for cid in ids:
+        if cid in out:
+            continue
+        entry = index.get(cid)
+        if not entry:
+            continue
+        submit_time = entry.get("submit_time")
+        if submit_time:
+            out[cid] = submit_time
+    return out
+
+
 # ---------------------------------------------------------------------------
 # QC status-change requests (QC proposes, SPQ Head approves/rejects)
 # ---------------------------------------------------------------------------
@@ -1157,6 +1322,92 @@ def get_qc_status_request(db: Session, result_id: str) -> Optional[QcStatusReque
     )
 
 
+def _manual_verdict(req) -> Optional[str]:
+    """Manual Status EFEKTIF dari sebuah baris permintaan: vonisnya hanya berlaku
+    setelah final. Duplikat kecil dari ``compliance.stats_aggregate.manual_status_of``
+    supaya lapisan db/ tidak perlu mengimpor compliance/."""
+    if req is None:
+        return None
+    tl = (getattr(req, "tl_qc_status", None) or "pending")
+    if tl == "approved":
+        eff = "approved"
+    elif tl == "rejected":
+        eff = "rejected"
+    elif tl == "escalated":
+        eff = getattr(req, "approval_status", None) or "pending"
+    else:
+        eff = "pending"
+    if eff != "approved":
+        return None
+    return (getattr(req, "requested_status", "") or "").strip().upper() or None
+
+
+def add_qc_status_event(
+    db: Session,
+    result_id: str,
+    event: str,
+    actor_username: str = None,
+    actor_role: str = None,
+    requested_status: str = None,
+    status_before: str = None,
+    status_after: str = None,
+    comment: str = None,
+) -> QcStatusEvent:
+    """Catat satu kejadian Manual Status (append-only). Tidak pernah dipakai untuk
+    menghitung status yang berlaku — murni jejak audit untuk ditampilkan."""
+    row = QcStatusEvent(
+        result_id=uuid.UUID(str(result_id)),
+        event=event,
+        actor_username=actor_username,
+        actor_role=actor_role,
+        requested_status=requested_status,
+        status_before=status_before,
+        status_after=status_after,
+        comment=comment,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def qc_status_events_for_result(db: Session, result_id: str) -> list:
+    """Riwayat Manual Status satu tiket, TERLAMA dulu."""
+    return (
+        db.query(QcStatusEvent)
+        .filter(QcStatusEvent.result_id == uuid.UUID(str(result_id)))
+        .order_by(QcStatusEvent.created_at, QcStatusEvent.id)
+        .all()
+    )
+
+
+def qc_status_events_for_results(db: Session, result_ids: list[str]) -> dict:
+    """``str(result_id) -> [event, ...]`` (terlama dulu) dalam satu query."""
+    if not result_ids:
+        return {}
+    uuids = [uuid.UUID(str(r)) for r in result_ids]
+    out: dict = {}
+    for row in (
+        db.query(QcStatusEvent)
+        .filter(QcStatusEvent.result_id.in_(uuids))
+        .order_by(QcStatusEvent.created_at, QcStatusEvent.id)
+        .all()
+    ):
+        out.setdefault(str(row.result_id), []).append(row)
+    return out
+
+
+def _upsert_event_for(origin: str) -> str:
+    """Nama kejadian riwayat Manual Status untuk sebuah ``origin``."""
+    if origin == "qc":
+        return "usul"
+    # QC membenarkan AI Status pada penetapan pertama — final tanpa hierarki, tapi
+    # bukan "ditetapkan langsung" oleh reviewer, jadi dicatat sebagai kejadian sendiri.
+    if origin == "qc_confirm":
+        return "konfirmasi"
+    return "set_langsung"
+
+
 def upsert_qc_status_request(
     db: Session,
     result_id: str,
@@ -1164,9 +1415,29 @@ def upsert_qc_status_request(
     reason: str,
     username: str = None,
     role: str = None,
+    origin: str = "qc",
 ) -> QcStatusRequest:
-    """Create or replace the QC request for a result, resetting it to pending."""
+    """Create or replace the human verdict (Manual Status) for a result.
+
+    ``origin='qc'`` -> a QC PROPOSAL that must run the QC -> TL QC -> SPQ Head review;
+    the row starts at pending on both tiers (see below).
+    ``origin='tl_direct'`` / ``'spq_direct'`` -> Team Leader QC / SPQ Head setting the
+    verdict THEMSELVES; they need no approval, so the row is finalized on creation by
+    ``finalize_qc_status_request`` right after this call — including when it replaces a
+    QC proposal that was still waiting.
+    ``origin='qc_confirm'`` -> QC's FIRST verdict on a ticket that merely REPEATS the
+    AI Status (nothing changes, so no hierarchy reviews it). Finalized on creation the
+    same way; the caller decides this, see ``_confirms_ai_status`` in the router.
+
+    There is ONE row per result, so a QC changing their mind overwrites the existing
+    request — which means the whole tiered review (QC -> Team Leader QC -> SPQ Head)
+    must start over. BOTH tiers are cleared: leaving ``tl_qc_status`` behind made the
+    NEW request inherit the OLD decision, and since ``effective_appeal_status`` reads
+    that field first, an inherited ``approved`` applied the new ``requested_status``
+    immediately — a QC could flip a ticket to Qualified with nobody reviewing it.
+    """
     req = get_qc_status_request(db, result_id)
+    status_before = _manual_verdict(req)
     if req is None:
         req = QcStatusRequest(result_id=uuid.UUID(str(result_id)))
         db.add(req)
@@ -1175,12 +1446,54 @@ def upsert_qc_status_request(
     req.requested_by_username = username
     req.requested_by_role = role
     req.requested_at = datetime.utcnow()
+    req.origin = origin
+    # Tier 1 — Team Leader QC.
+    req.tl_qc_status = "pending"
+    req.tl_qc_username = None
+    req.tl_qc_reviewed_at = None
+    req.tl_qc_comment = None
+    # Tier 2 — SPQ Head (only reachable once TL QC escalates).
     req.approval_status = "pending"
     req.reviewed_by_username = None
     req.reviewed_at = None
+    req.review_comment = None
     db.commit()
     db.refresh(req)
+    # Usulan QC belum jadi vonis; baris direct difinalkan tepat setelah ini oleh
+    # finalize_qc_status_request, yang mencatat status_after-nya sendiri.
+    add_qc_status_event(
+        db, result_id=result_id,
+        event=_upsert_event_for(origin),
+        actor_username=username, actor_role=role,
+        requested_status=requested_status,
+        status_before=status_before,
+        status_after=(None if origin == "qc" else requested_status),
+        comment=reason,
+    )
     return req
+
+
+def finalize_qc_status_request(
+    db: Session,
+    result_id: str,
+    reviewer_username: str = None,
+) -> Optional[QcStatusRequest]:
+    """Mark a Manual Status row as FINAL without any review.
+
+    Used for the direct set by Team Leader QC / SPQ Head, who need no approval: the
+    verdict counts the moment they save it. Finalising through ``tl_qc_status`` (the
+    tier ``effective_appeal_status`` reads first) means a direct verdict also REPLACES
+    a QC proposal that was still waiting — the proposal's pending state is gone.
+    """
+    req = get_qc_status_request(db, result_id)
+    if req is None:
+        return None
+    req.tl_qc_status = "approved"
+    req.tl_qc_username = reviewer_username
+    req.tl_qc_reviewed_at = datetime.utcnow()
+    db.commit()
+    db.refresh(req)
+    return req  # kejadiannya sudah dicatat oleh upsert_qc_status_request (set_langsung)
 
 
 def review_qc_status_request(
@@ -1195,12 +1508,21 @@ def review_qc_status_request(
     req = get_qc_status_request(db, result_id)
     if req is None:
         return None
+    status_before = _manual_verdict(req)
     req.approval_status = "approved" if decision == "approve" else "rejected"
     req.reviewed_by_username = reviewer_username
     req.reviewed_at = datetime.utcnow()
     req.review_comment = comment
     db.commit()
     db.refresh(req)
+    add_qc_status_event(
+        db, result_id=result_id,
+        event=("spq_approve" if decision == "approve" else "spq_reject"),
+        actor_username=reviewer_username, actor_role="spq_head",
+        requested_status=req.requested_status,
+        status_before=status_before, status_after=_manual_verdict(req),
+        comment=comment,
+    )
     return req
 
 
@@ -1237,12 +1559,21 @@ def tl_review_qc_status_request(
     req = get_qc_status_request(db, result_id)
     if req is None:
         return None
+    status_before = _manual_verdict(req)
     req.tl_qc_status = _TL_DECISION.get(decision, "rejected")
     req.tl_qc_username = reviewer_username
     req.tl_qc_reviewed_at = datetime.utcnow()
     req.tl_qc_comment = comment
     db.commit()
     db.refresh(req)
+    add_qc_status_event(
+        db, result_id=result_id,
+        event={"approve": "tl_approve", "reject": "tl_reject"}.get(decision, "tl_escalate"),
+        actor_username=reviewer_username, actor_role="team_leader_qc",
+        requested_status=req.requested_status,
+        status_before=status_before, status_after=_manual_verdict(req),
+        comment=comment,
+    )
     return req
 
 
@@ -1269,10 +1600,15 @@ def create_error_code_appeal(
     qc_risk_base: str = None,
     appeal_kind: str = "remove",
     add_source: str = None,
+    origin: str = "qc",
     username: str = None,
 ) -> ErrorCodeAppeal:
     """Insert a new (pending) appeal row. Append-only, so repeated appeals on the
-    same error code accumulate as history."""
+    same error code accumulate as history.
+
+    ``origin`` marks a QC submission ('qc', tiered review) vs a reviewer's DIRECT
+    edit ('tl_direct'/'spq_direct'); a direct row is finalized by the caller
+    (via ``tl_review_error_code_appeal(decision='approve')``) so it applies at once."""
     appeal = ErrorCodeAppeal(
         result_id=uuid.UUID(str(result_id)),
         error_code=error_code,
@@ -1292,6 +1628,7 @@ def create_error_code_appeal(
         qc_risk_base=qc_risk_base,
         appeal_kind=(appeal_kind or "remove"),
         add_source=add_source,
+        origin=(origin or "qc"),
         requested_by_username=username,
         requested_at=datetime.utcnow(),
         approval_status="pending",
@@ -1512,7 +1849,24 @@ def qc_manual_check_history(db: Session, result_id: str) -> list[QcManualCheck]:
     )
 
 
-def qc_performance_rows(db: Session) -> list[dict]:
+def customer_ids_uploaded_by_role(db: Session, role: str) -> list[str]:
+    """Customer/ticket id dari seluruh result yang di-upload oleh ``role``.
+
+    Dipakai men-scope Statistics milik QC Support ke himpunan complaint-nya sendiri —
+    cakupan yang sama dengan filter ``uploaded_by_role`` di ``list_results``, supaya
+    angka Statistics dan daftar Results tidak lagi bercerita berbeda.
+    """
+    out = []
+    for (sf,) in db.query(Result.source_files).filter(Result.uploaded_by_role == role).all():
+        if sf and isinstance(sf[0], str) and sf[0]:
+            cid = sf[0].split("_", 1)[0].strip()
+            if cid:
+                out.append(cid)
+    return out
+
+
+def qc_performance_rows(db: Session, campaign: str = None,
+                        campaigns: Optional[list[str]] = None) -> list[dict]:
     """Per-QC assignment/approval tally for the QC table in Hierarki Error Rate.
 
     Returns ``[{qc_username, name, assigned, approved, approve_rate}]``.
@@ -1524,12 +1878,37 @@ def qc_performance_rows(db: Session) -> list[dict]:
     tracks results/appeals only, so it would not invalidate when a QC approves
     a ticket and this table would read stale.
     """
+    # Filter campaign (tab Hierarki Error Rate): daftar ticket id milik campaign itu.
+    # ``QcAssignment`` menyimpan ticket_id, bukan campaign, jadi dipetakan lewat
+    # prefix nama berkas sumber di ``results`` — sama seperti kolom ID di dashboard.
+    # ``campaign`` = pilihan pemakai, ``campaigns`` = batas campaign role (None =
+    # tanpa batas, daftar kosong = tidak ada yang lolos); keduanya dipasang bersama.
+    only_tickets = None
+    wanted = None
+    if campaign:
+        wanted = [campaign.strip().casefold()]
+    if campaigns is not None:
+        allowed = [str(c).strip().casefold() for c in campaigns if str(c).strip()]
+        wanted = [c for c in wanted if c in allowed] if wanted is not None else allowed
+    if wanted is not None:
+        only_tickets = set()
+        if wanted:
+            for sf in db.query(Result.source_files).filter(
+                func.lower(func.trim(Result.campaign)).in_(wanted)
+            ).all():
+                files = sf[0] or []
+                if files and isinstance(files[0], str) and files[0]:
+                    only_tickets.add(files[0].split("_", 1)[0].strip())
+
     # qc_username (casefold) -> {ticket_id}
     assigned: dict = defaultdict(set)
     for row in db.query(QcAssignment).all():
         u = (row.qc_username or "").strip()
         if u and row.ticket_id:
-            assigned[u.casefold()].add(row.ticket_id.strip())
+            tid = row.ticket_id.strip()
+            if only_tickets is not None and tid not in only_tickets:
+                continue
+            assigned[u.casefold()].add(tid)
 
     checks = db.query(QcManualCheck).all()
     # Map only the results that actually carry a check -> their ticket id.

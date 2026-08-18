@@ -7,6 +7,7 @@ output shape — a ``verifications`` list with one row per field compared agains
 its reference ("acuan") value — so the dashboard can render a uniform table
 (field | acuan | document | similarity | match | reason).
 """
+import re
 
 # Per-row schema: one verified field compared against its reference value.
 ITEM_PROPS = {
@@ -75,3 +76,73 @@ def fmt_acuan(value) -> str:
     if value is None or str(value).strip() == "":
         return "(tidak tersedia)"
     return str(value).strip()
+
+
+# --------------------------------------------------------------------------
+# Numeric-identifier normalisation (NPWP / NIK / nomor rekening / ...).
+# --------------------------------------------------------------------------
+# The bank side (TMS/Ascend CSV) stores these identifiers as bare digits
+# ("070563382036000"), but the document prints them formatted
+# ("07.056.338.2-036.000") and the OCR copies that formatting verbatim — so the
+# stored ``document`` value never lines up with the acuan column it is compared
+# against, and the dashboard shows two strings that look unrelated even when the
+# digits are identical. The prompt already tells the model to ignore separators
+# when deciding ``match``, but that is a request, not a guarantee.
+#
+# So for the fields listed in a prompt module's ``NUMERIC_FIELDS`` we strip every
+# non-digit from BOTH sides after the OCR returns, and — since a pure-digit
+# identifier admits exactly one comparison — decide ``match`` in code instead of
+# trusting the model's. Applied by ``compliance.documents.normalize_ocr_json``.
+
+_NON_DIGIT = re.compile(r"\D+")
+
+
+def digits_only(value) -> str | None:
+    """``"07.056.338.2-036.000" -> "070563382036000"``.
+
+    Returns ``None`` when ``value`` is empty or carries no digit at all (e.g.
+    "tidak terbaca"), so callers can keep the original text in that case.
+    """
+    if value is None:
+        return None
+    return _NON_DIGIT.sub("", str(value)) or None
+
+
+def normalize_numeric_row(row: dict) -> dict:
+    """Digits-only ``acuan``/``document`` for one verification row, with ``match``
+    recomputed from the normalised digits.
+
+    A side without any digit is left untouched (nothing to normalise, and the
+    text may explain why the field is missing); ``match`` is only recomputed when
+    BOTH sides normalised to digits.
+    """
+    out = dict(row)
+    acuan = digits_only(row.get("acuan"))
+    document = digits_only(row.get("document"))
+    if acuan is not None:
+        out["acuan"] = acuan
+    if document is not None:
+        out["document"] = document
+    if acuan is None or document is None:
+        return out
+
+    match = acuan == document
+    if match:
+        out["match"] = True
+        out["similarity"] = 100
+        if not row.get("match"):
+            out["reason"] = (
+                "Digit nomor pada dokumen sama dengan acuan setelah pemisah "
+                "(titik/strip/spasi) diabaikan."
+            )
+    else:
+        out["match"] = False
+        # A mismatch cannot be 100% similar; keep the model's figure otherwise.
+        similarity = row.get("similarity")
+        if not isinstance(similarity, int) or isinstance(similarity, bool):
+            out["similarity"] = 0
+        elif similarity >= 100:
+            out["similarity"] = 99
+        if row.get("match"):
+            out["reason"] = "Digit nomor pada dokumen berbeda dengan acuan."
+    return out

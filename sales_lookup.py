@@ -47,6 +47,23 @@ def _norm(value) -> str:
     return str(value).strip()
 
 
+# Kolom roster jarang dikosongkan — yang tidak ada isinya diberi PLACEHOLDER:
+# 12 baris padding di akhir sheet memakai USER ID "0" / NIP "00000000" / nama "-",
+# dan agen berstatus MUTASI kehilangan atasannya dengan cara yang sama (NIP TL &
+# NIP TLM "0", NAMA TL & NAMA AM "-"). Placeholder BUKAN identitas orang: dibiarkan
+# apa adanya, NIP AM "0" + NAMA AM "-" menjadi satu opsi "-" di dropdown Semua AM
+# (idem Semua TL) dan baris padding menjadi satu "agent" hantu.
+_PLACEHOLDERS = {"-", "--", "n/a", "na", "none", "null", "#n/a", "#ref!"}
+
+
+def _person(value) -> str:
+    """``_norm``, tapi placeholder roster ("-", "0", "00000000", …) jadi ''."""
+    s = _norm(value)
+    if not s or s.casefold() in _PLACEHOLDERS:
+        return ""
+    return "" if set(s) == {"0"} else s
+
+
 def _to_date(value, formats) -> "date | None":
     """Coerce a datetime/date/string cell into a ``date`` (None if unparseable)."""
     if value is None or value == "":
@@ -145,21 +162,25 @@ def active_sales_map(db) -> dict:
                 for r in rows:
                     if not r or uid_i >= len(r):
                         continue
-                    uid = _norm(r[uid_i])
+                    # Semua kolom identitas dibaca lewat _person(), bukan _norm():
+                    # placeholder roster harus jadi kosong SEBELUM tersimpan, supaya
+                    # tidak ada konsumen (dropdown filter, hierarki Statistics,
+                    # scoping login) yang perlu tahu soal "-" dan "0".
+                    uid = _person(r[uid_i])
                     if not uid:
-                        continue
-                    name = _norm(r[name_i]) if (name_i is not None and name_i < len(r)) else ""
+                        continue  # baris padding "0" — bukan agent
+                    name = _person(r[name_i]) if (name_i is not None and name_i < len(r)) else ""
                     join_date = (
                         _to_date(r[join_i], _JOIN_FORMATS)
                         if (join_i is not None and join_i < len(r))
                         else None
                     )
-                    team_leader = _norm(r[tl_i]) if (tl_i is not None and tl_i < len(r)) else ""
-                    area_manager = _norm(r[am_i]) if (am_i is not None and am_i < len(r)) else ""
-                    nip_tl = _norm(r[niptl_i]) if (niptl_i is not None and niptl_i < len(r)) else ""
-                    dedicated = _norm(r[ded_i]) if (ded_i is not None and ded_i < len(r)) else ""
-                    nip_am = _norm(r[nipam_i]) if (nipam_i is not None and nipam_i < len(r)) else ""
-                    nip_baru = _norm(r[nipbaru_i]) if (nipbaru_i is not None and nipbaru_i < len(r)) else ""
+                    team_leader = _person(r[tl_i]) if (tl_i is not None and tl_i < len(r)) else ""
+                    area_manager = _person(r[am_i]) if (am_i is not None and am_i < len(r)) else ""
+                    nip_tl = _person(r[niptl_i]) if (niptl_i is not None and niptl_i < len(r)) else ""
+                    dedicated = _person(r[ded_i]) if (ded_i is not None and ded_i < len(r)) else ""
+                    nip_am = _person(r[nipam_i]) if (nipam_i is not None and nipam_i < len(r)) else ""
+                    nip_baru = _person(r[nipbaru_i]) if (nipbaru_i is not None and nipbaru_i < len(r)) else ""
                     mapping[uid.casefold()] = {
                         "name": name or None,
                         "join_date": join_date,
@@ -179,10 +200,34 @@ def active_sales_map(db) -> dict:
     return mapping
 
 
-def _cashline_agent_ids_by(db, field: str, value: str) -> set:
-    """Return agent USER IDs (casefold) whose ``entry[field]`` matches ``value``
-    (trimmed) and whose ``DEDICATED`` is the Cashline campaign. Empty set when
-    ``value`` is blank or nothing matches."""
+def _dedicated_matches(entry, campaigns) -> bool:
+    """Apakah baris roster ini termasuk cakupan ``campaigns``.
+
+    ``None`` berarti TIDAK dibatasi (semua campaign lolos). List KOSONG berarti
+    dibatasi ke himpunan kosong, jadi tidak ada satu pun baris yang lolos — keduanya
+    tidak boleh disamakan, lihat ``api.rbac.effective_campaigns_for``.
+
+    Pembandingannya casefold karena kolom DEDICATED di spreadsheet campur huruf
+    besar-kecil ("CASHLINE" 106 baris, "Cashline" 1 baris).
+    """
+    if campaigns is None:
+        return True
+    if not campaigns:
+        return False
+    ded = _norm(entry.get("dedicated")).casefold()
+    return ded in {(c or "").strip().casefold() for c in campaigns}
+
+
+def _agent_ids_by(db, field: str, value: str, campaigns=None) -> set:
+    """Agent USER ID (casefold) yang ``entry[field]``-nya sama dengan ``value``
+    dan DEDICATED-nya masuk ``campaigns``. Set kosong bila ``value`` kosong atau
+    tidak ada yang cocok.
+
+    Dulu fungsi ini mengunci DEDICATED == "cashline". Akibatnya 273 dari 379 baris
+    roster (NTB, LOC, RETENTION, REINSTATE, ACTIVATION, MEGAPAY) tidak pernah
+    terlihat sistem. Sekarang campaign-nya datang dari ``roster_campaigns_for`` —
+    lihat ``api.rbac.effective_campaigns_for``.
+    """
     key = _norm(value)
     if not key:
         return set()
@@ -190,62 +235,134 @@ def _cashline_agent_ids_by(db, field: str, value: str) -> set:
     for uid, entry in active_sales_map(db).items():
         if _norm(entry.get(field)) != key:
             continue
-        if _norm(entry.get("dedicated")).casefold() != "cashline":
+        if not _dedicated_matches(entry, campaigns):
             continue
         out.add(uid)
     return out
 
 
+def agent_ids_for_tl(db, nip_tl: str, campaigns=None) -> set:
+    """Agent USER ID di bawah Team Leader ``nip_tl`` (kolom H ``NIP TL``)."""
+    return _agent_ids_by(db, "nip_tl", nip_tl, campaigns)
+
+
+def agent_ids_for_agent(db, nip_baru: str, campaigns=None) -> set:
+    """Agent USER ID milik agent itu sendiri (kolom C ``NIP BARU``)."""
+    return _agent_ids_by(db, "nip_baru", nip_baru, campaigns)
+
+
+def agent_ids_for_am(db, nip_am: str, campaigns=None) -> set:
+    """Agent USER ID di bawah Area Manager ``nip_am`` (kolom J ``NIP AM``) —
+    seluruh agent di bawah SEMUA team leader-nya (AM -> TL -> Agent)."""
+    return _agent_ids_by(db, "nip_am", nip_am, campaigns)
+
+
+# Kolom roster yang menyimpan NIP orangnya, per cakupan data.
+_SCOPE_NIP_FIELD = {
+    "sales_agent": "nip_baru",
+    "sales_tl": "nip_tl",
+    "sales_am": "nip_am",
+}
+
+
+def roster_campaign_index(db, scope: str) -> dict:
+    """``{NIP (casefold) -> [campaign, ...]}`` untuk satu tingkat hierarki.
+
+    Versi massal dari ``roster_campaigns_for``: sekali lewat roster, bukan sekali
+    per orang. Dipakai menu Manage Role untuk merangkum variasi tag yang benar-benar
+    dipegang user sebuah role — dengan ratusan user, memanggil versi per-orang berarti
+    ratusan kali melintasi roster untuk jawaban yang sama.
+    """
+    field = _SCOPE_NIP_FIELD.get(scope)
+    if not field:
+        return {}
+    out: dict = {}
+    for entry in active_sales_map(db).values():
+        nip = _norm(entry.get(field))
+        if not nip:
+            continue
+        ded = _norm(entry.get("dedicated")).casefold()
+        if not ded:
+            continue
+        out.setdefault(nip.casefold(), set()).add(ded)
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def roster_campaigns_for(db, username: str, scope: str) -> list:
+    """Campaign yang melekat pada SESEORANG menurut kolom DEDICATED di roster.
+
+    Inilah tag campaign sisi sales — dan sudah otoritatif tanpa perlu role terpisah
+    per campaign: dari 379 baris roster, ke-377 agent dan ke-15 team leader masing
+    -masing hanya ada di SATU campaign, sehingga NIP-nya sendiri sudah menentukan
+    campaign-nya. Area Manager memang lintas campaign (4 dari 5 orang, satu memegang
+    lima), dan itu justru sebabnya campaign tidak bisa dititipkan ke nama role:
+    ``users.role`` hanya memuat satu nilai.
+
+    Dikembalikan sebagai NAMA CAMPAIGN (huruf kecil, sejajar ``campaigns.name`` dan
+    ``results.campaign``), bukan nilai mentah DEDICATED yang huruf besar.
+
+    List kosong berarti orangnya tidak ada di roster. Pemanggil TIDAK boleh
+    menganggapnya "semua campaign" — untuk cakupan sales, himpunan agent-nya juga
+    kosong sehingga daftar Results memendek ke nol dengan sendirinya.
+    """
+    field = _SCOPE_NIP_FIELD.get(scope)
+    me = _norm(username)
+    if not field or not me:
+        return []
+    out = set()
+    for entry in active_sales_map(db).values():
+        if _norm(entry.get(field)) != me:
+            continue
+        ded = _norm(entry.get("dedicated")).casefold()
+        if ded:
+            out.add(ded)
+    return sorted(out)
+
+
+# Nama lama, dipertahankan supaya pemanggil yang belum diubah tetap jalan. Keduanya
+# mengunci campaign cashline seperti sebelumnya.
 def cashline_agent_ids_for_tl(db, nip_tl: str) -> set:
-    """Agent USER IDs under Team Leader ``nip_tl`` — scopes a ``sales_agent`` (TL)
-    login whose ``username`` is the TL's NIP (column H ``NIP TL``)."""
-    return _cashline_agent_ids_by(db, "nip_tl", nip_tl)
+    return agent_ids_for_tl(db, nip_tl, ["cashline"])
 
 
 def cashline_agent_ids_for_agent(db, nip_baru: str) -> set:
-    """Agent USER ID(s) for a ``sales_agent`` (individual agent) login whose
-    ``username`` is the agent's own NIP (column C ``NIP BARU``) — scopes them to
-    their own tickets."""
-    return _cashline_agent_ids_by(db, "nip_baru", nip_baru)
+    return agent_ids_for_agent(db, nip_baru, ["cashline"])
 
 
 def cashline_agent_ids_for_am(db, nip_am: str) -> set:
-    """Agent USER IDs under Area Manager ``nip_am`` — scopes an ``area_manager``
-    login whose ``username`` is the AM's NIP (column J ``NIP AM``). Returns every
-    agent across ALL team leaders below this area manager (Area Manager -> Team
-    Leader -> Agent)."""
-    return _cashline_agent_ids_by(db, "nip_am", nip_am)
+    return agent_ids_for_am(db, nip_am, ["cashline"])
 
 
-# Roles that see the whole org chart in the Results hierarchy filter.
-_UNSCOPED_FILTER_ROLES = {"spq_head", "admin", "team_leader_qc", "telesales_head"}
-
-
-def hierarchy_filter_options(db, role: str, username: str) -> dict:
-    """Dropdown options for the Results hierarchy filter, scoped to ``role``.
+def hierarchy_filter_options(db, data_scope: str, username: str, campaigns=None) -> dict:
+    """Dropdown options for the Results hierarchy filter, scoped by ``data_scope``.
 
     Returns ``{"area_managers": [...], "team_leaders": [...], "agents": [...]}``
     where each entry is ``{"nip", "name", "nip_tl", "nip_am"}``. Values are NIPs
     (stable keys the list endpoint filters on); names are display-only and may
     repeat or be blank in the source spreadsheet.
 
-    Scope mirrors ``_scoped_customer_ids``: an Area Manager only ever sees their
-    own TLs/agents, a Team Leader only their agents. Roles with no subordinates
-    (sales_agent, qc, qc_support) get empty lists, so the UI hides the filter.
+    Cakupannya mengikuti ``_scoped_customer_ids``: ``sales_am`` hanya melihat TL &
+    agent-nya sendiri, ``sales_tl`` hanya agent-nya. Cakupan tanpa bawahan
+    (``sales_agent``, ``qc_assigned``, ``qc_support_own``) mendapat daftar kosong
+    sehingga UI menyembunyikan filternya.
+
+    Dulu fungsi ini bercabang pada NAMA role, sehingga role buatan operator — mis.
+    ``tl_ntb`` — jatuh ke cabang "tak dikenal" dan kehilangan dropdown hierarkinya
+    meski cakupan datanya jelas ``sales_tl``.
     """
     empty = {"area_managers": [], "team_leaders": [], "agents": []}
-    role = (role or "").strip()
+    data_scope = (data_scope or "").strip()
     me = _norm(username)
 
     entries = [
         e for e in active_sales_map(db).values()
-        if _norm(e.get("dedicated")).casefold() == "cashline"
+        if _dedicated_matches(e, campaigns)
     ]
-    if role in _UNSCOPED_FILTER_ROLES:
-        pass  # every agent row is in scope
-    elif role == "area_manager":
+    if data_scope == "all":
+        pass  # setiap baris agent masuk cakupan
+    elif data_scope == "sales_am":
         entries = [e for e in entries if _norm(e.get("nip_am")) == me]
-    elif role == "team_leader":
+    elif data_scope == "sales_tl":
         entries = [e for e in entries if _norm(e.get("nip_tl")) == me]
     else:
         return empty
@@ -274,24 +391,25 @@ def hierarchy_filter_options(db, role: str, username: str) -> dict:
     return {
         # An Area Manager does not need to filter by themselves, and a Team
         # Leader needs neither level above them.
-        "area_managers": sorted(ams.values(), key=by_name) if role in _UNSCOPED_FILTER_ROLES else [],
-        "team_leaders": sorted(tls.values(), key=by_name) if role != "team_leader" else [],
+        "area_managers": sorted(ams.values(), key=by_name) if data_scope == "all" else [],
+        "team_leaders": sorted(tls.values(), key=by_name) if data_scope != "sales_tl" else [],
         "agents": sorted(agents, key=by_name),
     }
 
 
-def agent_ids_for_hierarchy_filter(db, am_nip: str, tl_nip: str, agent_nip: str) -> Optional[set]:
+def agent_ids_for_hierarchy_filter(db, am_nip: str, tl_nip: str, agent_nip: str,
+                                  campaigns=None) -> Optional[set]:
     """Agent USER IDs matching the most specific hierarchy filter supplied.
 
     Returns None when no filter is set (meaning "do not narrow"), which the
     caller must distinguish from an empty set ("filter matched nothing").
     """
     if _norm(agent_nip):
-        return cashline_agent_ids_for_agent(db, agent_nip)
+        return agent_ids_for_agent(db, agent_nip, campaigns)
     if _norm(tl_nip):
-        return cashline_agent_ids_for_tl(db, tl_nip)
+        return agent_ids_for_tl(db, tl_nip, campaigns)
     if _norm(am_nip):
-        return cashline_agent_ids_for_am(db, am_nip)
+        return agent_ids_for_am(db, am_nip, campaigns)
     return None
 
 

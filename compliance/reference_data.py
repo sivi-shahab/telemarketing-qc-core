@@ -15,6 +15,7 @@ import json
 from sqlalchemy.orm import Session
 
 from compliance.pdf_parser import ticket_id_from_filename
+from compliance.riplay import build_tnc_product_reference
 from db import crud
 
 # --- Reference data field maps ---------------------------------------------
@@ -27,11 +28,16 @@ CASHLINE_SINGLE_COLS = {
     "biaya_admin": "admin-fee",
     "nomor_rekening": "nomor-rekening",
     "nama_pemilik_rekening": "nama-di-rekening",
+    # Added in migration 0028 (previously constants in this module). An empty
+    # column falls back to the campaign's RIPLAY value — see build_reference_data.
+    "provisi": "provisi",
+    "penalti_pelunasan_dipercepat": "penalti-pelunasan-dipercepat",
 }
 CASHLINE_FIELD_ORDER = [
     "nominal_pencairan", "nama_bank", "tenor_dalam_bulan",
     "nominal_cicilan_per_bulan", "biaya_admin",
     "nomor_rekening", "nama_pemilik_rekening",
+    "provisi", "penalti_pelunasan_dipercepat",
 ]
 # Customer identity fields for the dashboard Results table (Sales Agent role).
 # customer_name -> cashline `cust_name`; account_number (ditampilkan sebagai
@@ -54,6 +60,7 @@ CARDHOLDER_SINGLE_COLS = {
 # against; the substring rule still keys off CUST_ADDR1 / CUST_EMP_ADDR1 (first line).
 CARDHOLDER_DOB_COLS = ["CUST_DTE_BIRTH"]
 CARDHOLDER_OFFICE_COLS = [
+    "CUST_EMP_NAME",
     "CUST_EMP_ADDR1", "CUST_EMP_ADDR2", "CUST_EMP_ADDR3", "CUST_EMP_ADDR4",
     "CUST_EMP_CITY", "CUST_EMP_ZIP",
 ]
@@ -177,12 +184,21 @@ def compute_bunga(cashline_ref: dict) -> str | None:
 def build_reference_data(
     customer_id: str,
     db: Session,
-) -> tuple[str, list[str]]:
+    riplay_extraction: dict | None = None,
+) -> tuple[str, list[str], dict]:
     """Build the CASHLINE + CARD HOLDER reference-data text block for ``customer_id``.
 
-    Returns ``(text, warnings)``. Missing rows/fields produce ``null`` values
+    Returns ``(text, warnings, raw)``. ``text`` adalah blok referensi untuk prompt
+    LLM, sedangkan ``raw`` berisi baris MENTAH ``{"cashline", "customer"}`` yang
+    disimpan pemanggil ke ``final_json["reference_data"]`` supaya dashboard tidak
+    perlu menembak Aplikasi A lagi. Missing rows/fields produce ``null`` values
     (and a warning) rather than failing, so a submission without matching reference
     rows still evaluates (the LLM marks unmatched fields as SKIPPED_NULL).
+
+    ``riplay_extraction`` (the campaign's stored RIPLAY) adds a TNC PRODUCT block:
+    the product-level terms each cashline field must sit within. TMS stays the
+    per-ticket ground truth; TnC Product only becomes the reference for a field
+    whose TMS column is empty.
     """
     warnings: list[str] = []
 
@@ -198,8 +214,6 @@ def build_reference_data(
         for field, col in CASHLINE_SINGLE_COLS.items():
             cashline_ref[field] = _clean(cashline_row.get(col)) or None
         cashline_ref["bunga"] = compute_bunga(cashline_ref)
-        cashline_ref["provisi"] = "2% dari limit kredit"
-        cashline_ref["penalti_pelunasan_dipercepat"] = "7% dari sisa pokok pinjaman"
         for field, col in CAMPAIGN_INTEREST_SINGLE_COLS.items():
             campaign_interest_ref[field] = _clean(cashline_row.get(col)) or None
 
@@ -225,9 +239,15 @@ def build_reference_data(
             cardholder_ref["alamat_rumah"] = _join_cols(custp_row, CARDHOLDER_HOME_COLS) or None
             cardholder_ref["alamat_pengiriman_tagihan"] = _join_cols(custp_row, CARDHOLDER_MAILING_COLS) or None
 
+    # Built last: the instalment row instantiates the RIPLAY formula with this
+    # ticket's TMS figures, so it needs the finished cashline_ref.
+    tnc_ref = build_tnc_product_reference(riplay_extraction, cashline_ref)
+
     text = (
         "=== CASHLINE REFERENCE DATA ===\n"
         + json.dumps(cashline_ref, ensure_ascii=False, indent=2)
+        + "\n\n=== TNC PRODUCT REFERENCE DATA ===\n"
+        + json.dumps(tnc_ref, ensure_ascii=False, indent=2)
         + "\n\n=== CARD HOLDER REFERENCE DATA ===\n"
         + json.dumps(cardholder_ref, ensure_ascii=False, indent=2)
         + "\n\n=== CAMPAIGN INTEREST REFERENCE DATA ===\n"

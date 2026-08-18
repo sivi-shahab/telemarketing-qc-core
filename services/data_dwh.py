@@ -29,7 +29,7 @@ cache database di App A) supaya pemanggilan cashline & customer yang
 berurutan (lihat reference_data.build_reference_data) hanya menembak API sekali.
 
 Konfigurasi (env var):
-  - DWH_API_BASE_URL      base URL API Aplikasi A (default "http://localhost:8000")
+  - DWH_API_BASE_URL      base URL API Aplikasi A (default "http://localhost:8002")
   - DWH_API_TIMEOUT_SEC   timeout per request (default 10)
   - DWH_API_CACHE_TTL_SEC TTL cache in-memory App B per result_id (default 5)
 """
@@ -43,7 +43,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-DWH_API_BASE_URL = os.getenv("DWH_API_BASE_URL", "http://localhost:8000").rstrip("/")
+DWH_API_BASE_URL = os.getenv("DWH_API_BASE_URL", "http://localhost:8002").rstrip("/")
 _API_PATH_CACHE = "/campaign/cashline-ntb-asscend/{result_id}"
 _API_PATH_ORIGINAL = "/campaign/cashline-ntb/{result_id}"
 _TIMEOUT_SEC = float(os.getenv("DWH_API_TIMEOUT_SEC", "10"))

@@ -7,3 +7,6 @@ openpyxl
 pdfplumber
 requests>=2.31
 pydantic-settings
+# Render halaman PDF RIPLAY jadi image sebelum dikirim ke model vision
+# (compliance/riplay.py, dipakai api/routers/campaign.py saat upload campaign).
+pypdfium2

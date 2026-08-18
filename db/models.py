@@ -15,10 +15,64 @@ class User(Base):
     name = Column(String(255))  # display name (full name)
     email = Column(String(255), unique=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
-    role = Column(String(20), nullable=False, default="sales_agent")
+    # The role KEY (see Role.key), not an FK — the historical role columns
+    # elsewhere (results.uploaded_by_role, qc_status_events.actor_role, ...) store
+    # the same string, so keeping it textual means they stay readable together.
+    role = Column(String(50), nullable=False, default="sales_agent")
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, server_default=func.now())
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+
+class Role(Base):
+    """A role definition: what it may do (``permissions``) and whose tickets it
+    sees (``data_scope``).
+
+    Roles used to be literal strings compared against hardcoded lists all over the
+    codebase; they are data now so SPQ Head / Admin can create new ones from the
+    Manage Role menu. ``is_system`` marks the ten roles that shipped before this
+    table existed — those cannot be deleted.
+    """
+    __tablename__ = "roles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String(50), unique=True, nullable=False)
+    label = Column(String(100), nullable=False)
+    is_system = Column(Boolean, nullable=False, default=False)
+    # Which existing role was used as the template when this one was created.
+    base_role = Column(String(50))
+    data_scope = Column(String(30), nullable=False, default="all")
+    permissions = Column(JSONB, nullable=False, default=list)
+    created_at = Column(DateTime, server_default=func.now())
+    created_by = Column(Integer, nullable=True)
+
+
+class RoleCampaign(Base):
+    """Campaign a role is limited to. NO rows for a role = every campaign."""
+    __tablename__ = "role_campaigns"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    role_id = Column(Integer, ForeignKey("roles.id", ondelete="CASCADE"), nullable=False)
+    campaign = Column(String(100), nullable=False)
+
+
+class UserCampaign(Base):
+    """Campaign SATU ORANG dibatasi ke sana (tab "Assign Role" di menu Manage Role).
+
+    TIDAK ADA baris untuk seorang user = user itu tidak dibatasi di tingkat orang;
+    yang berlaku hanya batas dari role-nya (``role_campaigns``) dan — untuk cakupan
+    sales — tag Dedicated di Sales Database.
+
+    Ada baris = batas ATAS tambahan: campaign efektif user adalah IRISAN dari
+    ketiganya, tidak pernah gabungan. Jadi assign di sini hanya bisa MEMPERSEMPIT,
+    tidak pernah memberi akses yang tidak dipunyai role-nya (lihat
+    ``api.rbac.effective_campaigns_for``).
+    """
+    __tablename__ = "user_campaigns"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    campaign = Column(String(100), nullable=False)
 
 
 class Campaign(Base):
@@ -34,6 +88,18 @@ class Campaign(Base):
     prompt_filename = Column(String(255))
     scorecard_filename = Column(String(255))
     kb_filename = Column(String(255))
+    # RIPLAY (Ringkasan Informasi Produk dan Layanan) — the bank's product fact
+    # sheet, treated as ground truth for the product values quoted on the call.
+    # ``kb_text_raw`` keeps the KB exactly as uploaded; ``kb_text`` is that text
+    # with the RIPLAY extraction overlaid (see compliance/riplay.py), so the
+    # overlay can always be regenerated from a pristine base.
+    kb_text_raw = Column(Text)
+    riplay_filename = Column(String(255))
+    riplay_product_name = Column(String(255))
+    riplay_similarity = Column(Float)
+    riplay_extraction = Column(JSONB)
+    riplay_applied = Column(JSONB)
+    riplay_uploaded_at = Column(DateTime)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -140,6 +206,11 @@ class TmsCashline(Base):
     nomor_rekening = Column("nomor-rekening", Text)
     nama_di_rekening = Column("nama-di-rekening", Text)
     admin_fee = Column("admin-fee", Text)
+    # Product fees the TMS export does not carry yet; added so they can be held as
+    # data (and overridden per ticket, e.g. a promo) instead of being constants in
+    # reference_data.py. Left empty, the RIPLAY TnC Product value is used instead.
+    provisi = Column("provisi", Text)
+    penalti_pelunasan_dipercepat = Column("penalti-pelunasan-dipercepat", Text)
     biaya_transfer = Column("biaya-transfer", Text)
     alamat_rumah_chk = Column("alamat-rumah-chk", Text)
     alamat_kantor_chk = Column("alamat-kantor-chk", Text)
@@ -332,7 +403,10 @@ class QcStatusRequest(Base):
         nullable=False,
         unique=True,
     )
-    requested_status = Column(String(4), nullable=False)  # PASS | FAIL
+    # Vonis HUMAN untuk tiket ini: PASS (Qualified) | FAIL (Not Qualified) | PENDING.
+    # Nilainya sejajar dengan AI Status, tetapi BERDIRI SENDIRI — sejak aturan Manual
+    # Status diluruskan, vonis human tidak lagi menimpa kolom AI Status.
+    requested_status = Column(String(10), nullable=False)  # PASS | FAIL | PENDING
     reason = Column(Text, nullable=False)
     requested_by_username = Column(String(100))
     requested_by_role = Column(String(20))
@@ -348,6 +422,12 @@ class QcStatusRequest(Base):
     # and SPQ Head's comment (on approve/reject). Mandatory on a reject, else optional.
     tl_qc_comment = Column(Text)
     review_comment = Column(Text)
+    # Bagaimana vonis ini masuk: 'qc' (usulan QC, melewati hierarki QC -> TL QC ->
+    # SPQ Head) atau ditetapkan LANGSUNG oleh reviewer yang tidak butuh approval —
+    # 'tl_direct' (Team Leader QC) / 'spq_direct' (SPQ Head). Baris direct dibuat
+    # sudah final (tl_qc_status='approved'). Mencerminkan kolom yang sama pada
+    # ErrorCodeAppeal. Default 'qc' mempertahankan baris lama.
+    origin = Column(String(20), nullable=False, default="qc")
 
 
 class ErrorCodeAppeal(Base):
@@ -406,6 +486,12 @@ class ErrorCodeAppeal(Base):
     # master-catalog code does not itself imply a source. One of
     # 'scorecard'|'cashline_data'|'card_holder'|'others' (NULL for remove/change).
     add_source = Column(String(20))
+    # How this banding entered the system: 'qc' (QC-submitted, flows through the
+    # tiered QC -> Team Leader QC -> SPQ Head review) or a DIRECT edit by a reviewer
+    # who needs no hierarchy — 'tl_direct' (Team Leader QC) / 'spq_direct' (SPQ Head).
+    # A direct row is created already finalized (tl_qc_status='approved'), so it
+    # applies immediately. Default 'qc' preserves existing rows.
+    origin = Column(String(20), nullable=False, default="qc")
     # Workflow.
     requested_by_username = Column(String(100))
     requested_at = Column(DateTime, server_default=func.now())
@@ -437,6 +523,43 @@ class QcAssignment(Base):
     qc_username = Column(String(100), nullable=False, index=True)
     assigned_by_username = Column(String(100))
     assigned_at = Column(DateTime, server_default=func.now())
+
+
+class QcStatusEvent(Base):
+    """Jejak audit APPEND-ONLY setiap perubahan Manual Status (vonis human).
+
+    ``QcStatusRequest`` menyimpan KEADAAN TERKINI saja (satu baris per tiket, ditimpa
+    tiap perubahan), jadi tanpa tabel ini tidak ada cara mengetahui vonis sebelumnya,
+    siapa mengubahnya, atau apa komentar reviewer yang sudah tertimpa. Satu baris di
+    sini = satu kejadian; tidak pernah di-update atau dihapus.
+
+    Sengaja tidak dipakai untuk MENGHITUNG apa pun — Manual Status yang berlaku tetap
+    dibaca dari ``QcStatusRequest``. Tabel ini murni untuk ditampilkan.
+    """
+    __tablename__ = "qc_status_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    result_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("results.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # usul        -> QC mengajukan (harus lewat hierarki)
+    # konfirmasi  -> vonis PERTAMA dari QC yang sama dengan AI Status (final tanpa hierarki)
+    # set_langsung-> TL QC / SPQ Head menetapkan sendiri (final saat itu juga)
+    # tl_approve | tl_reject | tl_escalate -> keputusan Team Leader QC
+    # spq_approve | spq_reject             -> keputusan SPQ Head
+    event = Column(String(20), nullable=False)
+    actor_username = Column(String(100))
+    actor_role = Column(String(20))
+    # Vonis yang diusulkan/ditetapkan saat kejadian ini (PASS | FAIL | PENDING).
+    requested_status = Column(String(10))
+    # Manual Status EFEKTIF sebelum & sesudah kejadian (NULL = belum ada vonis final).
+    status_before = Column(String(10))
+    status_after = Column(String(10))
+    comment = Column(Text)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class QcManualCheck(Base):

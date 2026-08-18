@@ -58,7 +58,18 @@ def ocr_document(
             "document_annotation_prompt": prompt,
         },
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        # ``raise_for_status()`` sendirian hanya menyimpan baris status ("422 Client
+        # Error … for url: …") — badan respons yang MENJELASKAN sebabnya hilang, dan
+        # pesan itulah yang tersimpan di documents.error_message serta tampil ke user.
+        # Tanpa badan respons, kegagalan seperti ini tidak bisa didiagnosis sama sekali
+        # setelah kejadiannya lewat.
+        body = (resp.text or "").strip()
+        raise requests.HTTPError(
+            f"{resp.status_code} {resp.reason} dari {base_url}"
+            + (f" — {body[:1000]}" if body else " — (respons kosong)"),
+            response=resp,
+        )
 
     annotation = resp.json().get("document_annotation")
     if annotation is None:

@@ -16,6 +16,10 @@ ACUAN_KEYS = [
     "nomor_rekening_acuan",
 ]
 
+# Pure-digit identifier: normalised to digits-only after the OCR, with ``match``
+# recomputed from the digits (see ``prompt._common.normalize_numeric_row``).
+NUMERIC_FIELDS = ["Nomor Rekening"]
+
 PROPS = make_props()
 SCHEMA = make_schema("cover_buku_tabungan_verification")
 

@@ -14,6 +14,8 @@ Sources:
 import re
 from datetime import datetime
 
+from compliance.riplay import check_tms_against_tnc
+
 # --- Source groups ----------------------------------------------------------
 SOURCE_SCORECARD = "scorecard"
 SOURCE_CARD_HOLDER = "card_holder"
@@ -55,7 +57,8 @@ ERROR_CODES = {
     "B10": {
         "desc": "Fitur/skrip/biaya produk tidak akurat",
         "source": SOURCE_SCORECARD,
-        "trigger": "Item BELUM_SESUAI di kategori Penjelasan / Final Konfirmasi Mega Cashline",
+        "trigger": ("Item BELUM_SESUAI di kategori Penjelasan Mega Cashline, "
+                    "Final Konfirmasi Mega Cashline, atau Final Konfirmasi Mega Ultima Shield"),
         "risk_base": "M",
     },
     "B11": {
@@ -150,7 +153,11 @@ _VERIFICATION_CODES = {"B02", "B03", "B05", "B17"}
 # Scorecard categories whose unmet (BELUM_SESUAI) items are surfaced as a derived
 # error code, keyed to each item's own item_code.
 CATEGORY_ERROR_CODES = [
-    {"categories": ["Penjelasan Mega Cashline", "Final Konfirmasi Mega Cashline"], "code": "B10"},
+    {"categories": [
+        "Penjelasan Mega Cashline",
+        "Final Konfirmasi Mega Cashline",
+        "Final Konfirmasi Mega Ultima Shield",
+    ], "code": "B10"},
     {"categories": ["Greeting"], "code": "B12"},
     {"categories": ["Legal Statement Mega Cashline", "Legal Statement Mega Ultima Shield"], "code": "B18"},
 ]
@@ -219,18 +226,198 @@ def strip_item_codes(reason) -> str:
     return text.strip(" -\u2013\u2014,;:").strip()
 
 
-def not_fulfilled_reason(item: dict) -> str:
-    """Negate the "Agent ..." requirement and tag the item code, e.g.
-    "Agent menyebutkan nama agent" (SC_CL_2) -> "Agent tidak menyebutkan nama agent (SC_CL_2)"."""
+def negate_requirement(req: str) -> str:
+    """Negate an "Agent ..." requirement: "Agent menyebutkan nama agent" ->
+    "Agent tidak menyebutkan nama agent". Non-"Agent" phrasings get a prefix."""
+    if not req:
+        return "Item scorecard belum terpenuhi."
+    m = _AGENT_RE.match(req)
+    return f"{m.group(1)}tidak {m.group(2)}" if m else f"Belum terpenuhi: {req}"
+
+
+# STATIC card-holder verification fields and the scorecard/critical item each one
+# drives (the inverse of CARD_HOLDER_STATIC_SCORECARD, plus a label for prose).
+# Negating the requirement ("Agent tidak memverifikasi tanggal lahir nasabah") is
+# WRONG for these items whenever the agent DID ask and the customer's answer simply
+# did not match Ascend — the failure is the data, not a missing step. The reader
+# cannot tell the two apart from the negated requirement alone, so these items get
+# their own sentence.
+STATIC_VERIFICATION_ITEMS = {
+    "SC_CL_23_1": ("tanggal_lahir", "tanggal lahir"),
+    "SC_CL_23_2": ("nama_ibu_kandung", "nama ibu kandung"),
+}
+# field -> label, kebalikan dari peta di atas (dipakai penjelasan indikasi fraud).
+STATIC_VERIFICATION_ITEMS_BY_FIELD = {
+    field: label for field, label in STATIC_VERIFICATION_ITEMS.values()
+}
+# Field yang tunduk pada CEK KONSISTENSI antar-penyebutan (tahap 1).
+STATIC_CONSISTENCY_FIELDS = tuple(STATIC_VERIFICATION_ITEMS_BY_FIELD)
+
+
+def static_verification_failure_reason(item_code, evaluation: dict) -> "str | None":
+    """Why a STATIC verification item failed, naming the ACTUAL cause.
+
+    Returns None when ``item_code`` is not a static verification item or its field
+    did not MISMATCH — the caller then keeps its own wording.
+
+    Three causes, read off the ``card_holder_verification`` row itself:
+      - customer never gave a value (``extracted_value`` empty) -> agent never asked;
+      - the customer's repeated answers disagreed with each other (STATIC
+        VERIFICATION CONSISTENCY RULE, < 90% between mentions) -> asked, but
+        inconsistent. Detected from the verification reason, the only signal the
+        evaluation carries for it; if it is worded differently the sentence falls
+        back to the mismatch wording below, which is still accurate.
+      - otherwise -> asked, but the answer does not match Ascend.
+    """
+    entry = STATIC_VERIFICATION_ITEMS.get(item_code)
+    if not entry or not isinstance(evaluation, dict):
+        return None
+    field, label = entry
+    row = None
+    for v in evaluation.get("card_holder_verification") or []:
+        if (v or {}).get("field") == field:
+            row = v or {}
+            break
+    if not row or row.get("match") != "MISMATCH":
+        return None
+    extracted = str(row.get("extracted_value") or "").strip()
+    reference = str(row.get("reference_value") or "").strip()
+    if not extracted:
+        return (f"Agent tidak menanyakan verifikasi statik {label} "
+                f"(nasabah tidak pernah menyebutkan nilainya)")
+    if _reason_says_inconsistent(row.get("reason")):
+        return (f"Agent menanyakan verifikasi statik {label} tetapi penyebutan nasabah "
+                f"tidak konsisten antar pengulangan")
+    detail = f'disebut "{extracted}"' + (f', Ascend "{reference}"' if reference else "")
+    return (f"Agent menanyakan verifikasi statik {label} tetapi data mismatch "
+            f"dengan Ascend ({detail})")
+
+
+def not_fulfilled_reason(item: dict, evaluation: dict = None) -> str:
+    """Why a scorecard item is unmet, tagged with its item code, e.g.
+    "Agent menyebutkan nama agent" (SC_CL_2) -> "Agent tidak menyebutkan nama agent (SC_CL_2)".
+
+    Pass ``evaluation`` so the STATIC verification items (SC_CL_23_1/23_2) can say
+    whether the agent failed to ASK or asked and got a non-matching answer — see
+    ``static_verification_failure_reason``. Without it the plain negation is used
+    (kept for backwards compatibility).
+    """
     item = item or {}
-    req = item.get("requirement") or ""
     item_code = item.get("item_code")
     suffix = f" ({item_code})" if item_code else ""
+    special = static_verification_failure_reason(item_code, evaluation)
+    if special:
+        return f"{special}{suffix}"
+    req = item.get("requirement") or ""
     if not req:
         return f"Item scorecard belum terpenuhi{suffix}."
-    m = _AGENT_RE.match(req)
-    neg = f"{m.group(1)}tidak {m.group(2)}" if m else f"Belum terpenuhi: {req}"
-    return f"{neg}{suffix}"
+    return f"{negate_requirement(req)}{suffix}"
+
+
+def _weight_of(item: dict) -> float:
+    """Numeric ``weight`` of a scorecard item, 0.0 when missing/unparseable."""
+    w = (item or {}).get("weight")
+    if isinstance(w, bool) or w is None:
+        return 0.0
+    try:
+        f = float(w)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if f != f else f
+
+
+def _tidy_number(value: float):
+    """4.5 -> 4.5, 22.0 -> 22 (avoids "22.0" in the dashboard)."""
+    return int(value) if value == int(value) else round(value, 2)
+
+
+def derive_category_summary(evaluation: dict) -> dict:
+    """Rebuild ``evaluation.category_summary`` from ``scorecard_result``.
+
+    The LLM emits ``category_summary`` as its OWN block, so it can contradict the very
+    scorecard it summarises — observed on live data: a category marked FAIL with score 0
+    while every one of its items is SESUAI (and the reverse, PASS while an item failed),
+    plus ~20% of rows carrying an ``earned_score``/``total_weight`` that does not match
+    the items. The scorecard is the authority (it is what the ticket score is computed
+    from), so the summary is derived from it instead of trusted:
+
+      - ``total_weight``    = sum of the category's item weights;
+      - ``earned_score``    = total_weight - weights of its BELUM_SESUAI items, i.e. the
+                              same arithmetic as ai_score_phase_2;
+      - ``category_result`` = FAIL when the category has >= 1 BELUM_SESUAI item, else PASS;
+      - ``fail_reason``     = the LLM's prose, kept ONLY when the category really fails.
+
+    Categories appear in scorecard order, so a category the LLM forgot to summarise
+    (32 occurrences on live data) is no longer missing. Display-only: no score, AI Status
+    or error code reads ``category_summary``, and the stored result_json is untouched —
+    this runs at read time.
+    """
+    if not isinstance(evaluation, dict):
+        return evaluation
+    items = evaluation.get("scorecard_result")
+    if not isinstance(items, list) or not items:
+        return evaluation
+    old_reason = {
+        c.get("category"): c.get("fail_reason")
+        for c in (evaluation.get("category_summary") or [])
+        if isinstance(c, dict)
+    }
+    order, agg = [], {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        cat = it.get("category")
+        if cat not in agg:
+            order.append(cat)
+            agg[cat] = {"weight": 0.0, "lost": 0.0, "failed": 0}
+        bucket = agg[cat]
+        w = _weight_of(it)
+        bucket["weight"] += w
+        if str(it.get("status") or "").strip().upper() == "BELUM_SESUAI":
+            bucket["lost"] += w
+            bucket["failed"] += 1
+    summary = []
+    for cat in order:
+        b = agg[cat]
+        failed = b["failed"] > 0
+        summary.append({
+            "category": cat,
+            "total_weight": _tidy_number(b["weight"]),
+            "earned_score": _tidy_number(b["weight"] - b["lost"]),
+            "category_result": "FAIL" if failed else "PASS",
+            "fail_reason": (old_reason.get(cat) or None) if failed else None,
+        })
+    return {**evaluation, "category_summary": summary}
+
+
+def annotate_critical_compliance_reasons(evaluation: dict) -> dict:
+    """Return ``evaluation`` with a ``reason`` on every ``critical_compliance_check``
+    checked item, so every surface renders the SAME sentence instead of negating the
+    requirement on its own (the dashboard used to do that in three separate places,
+    and the negation is wrong for the static verification items).
+
+    PASS items get no reason. Non-destructive: returns the original object when there
+    is nothing to annotate."""
+    if not isinstance(evaluation, dict):
+        return evaluation
+    ccc = evaluation.get("critical_compliance_check")
+    if not isinstance(ccc, dict):
+        return evaluation
+    items = ccc.get("checked_items")
+    if not isinstance(items, list) or not items:
+        return evaluation
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            out.append(it)
+            continue
+        if str(it.get("status") or "").strip().upper() == "PASS":
+            out.append({**it, "reason": None})
+            continue
+        reason = (static_verification_failure_reason(it.get("item_code"), evaluation)
+                  or negate_requirement(it.get("requirement") or ""))
+        out.append({**it, "reason": reason})
+    return {**evaluation, "critical_compliance_check": {**ccc, "checked_items": out}}
 
 
 def error_code_sort_key(code) -> tuple:
@@ -401,7 +588,7 @@ def build_error_code_table(evaluation: dict) -> list:
             SOURCE_SCORECARD,
             code,
             item.get("item_code"),
-            not_fulfilled_reason(item),
+            not_fulfilled_reason(item, evaluation),
             _evidence_text(evidence),
             evidence.get("ticket_id") or "",
             timestamp=_evidence_timestamp(evidence),
@@ -462,8 +649,55 @@ def build_error_code_table(evaluation: dict) -> list:
             "",
             extra={
                 "reference_value": v.get("reference_value"),
+                # Product terms from the RIPLAY. When a field's TMS column is
+                # empty this is the reference the verdict was made against, and
+                # the banding modal must show it instead.
+                "tnc_product": v.get("tnc_product"),
                 "extracted_value": v.get("extracted_value"),
                 "match": v.get("match"),
+            },
+        )
+
+    # --- 3b) Data-entry check: the TMS value itself vs the product terms ---
+    # A TMS value the product does not allow (tenor 6 when only 12/24/36 exist,
+    # provisi 5% when the RIPLAY says 2%) is an agent keying error, separate from
+    # what they said on the call. Deterministic — see compliance/riplay.py.
+    #
+    # NO DOUBLE COUNTING: at most ONE data-input row per field. A field that
+    # already produced a row above (transcript MISMATCH) has that row's reason
+    # enriched instead of gaining a second row, and no item_score is touched here,
+    # so this never changes ai_score / ai_status.
+    verification_rows = evaluation.get("cashline_data_verification") or []
+    by_field = {v.get("field"): v for v in verification_rows if (v or {}).get("field")}
+    tms_ref = {f: v.get("reference_value") for f, v in by_field.items()}
+    tnc_ref = {f: v.get("tnc_product") for f, v in by_field.items()}
+    cashline_label = SOURCE_LABELS[SOURCE_CASHLINE]
+
+    for field, detail in check_tms_against_tnc(tms_ref, tnc_ref).items():
+        item_code = titleize_field(field)
+        existing = next(
+            (r for r in rows if r.get("sumber") == cashline_label and r.get("item_code") == item_code),
+            None,
+        )
+        if existing is not None:
+            if detail not in (existing.get("reason") or ""):
+                existing["reason"] = f"{(existing.get('reason') or '').rstrip('. ')}. {detail}.".strip()
+            continue
+        source_row = by_field.get(field) or {}
+        # Every field carrying a product term is financial data -> B03 (medium).
+        # B02 covers the account fields, which have no product term at all.
+        add(
+            SOURCE_CASHLINE,
+            "B03",
+            item_code,
+            f"{detail}.",
+            "",
+            "",
+            extra={
+                "reference_value": source_row.get("reference_value"),
+                "tnc_product": source_row.get("tnc_product"),
+                "extracted_value": source_row.get("extracted_value"),
+                "match": source_row.get("match"),
             },
         )
 
@@ -693,30 +927,117 @@ def apply_approved_appeals(evaluation: dict, approved_appeals: list) -> dict:
     return {**evaluation, "scorecard_result": new_items}
 
 
+def _appeal_row_key(appeal) -> tuple:
+    """Baris Error Code yang dituju sebuah banding: ``(error_code, item_code)``."""
+    return (_appeal_attr(appeal, "error_code"), _appeal_attr(appeal, "item_code"))
+
+
 def _latest_per_key(appeals: list) -> list:
-    """Latest appeal per ``(error_code, item_code)`` — later submissions supersede."""
+    """Banding terbaru per ``(error_code, item_code, JENIS)`` — pengajuan berikutnya
+    menggantikan yang sebelumnya.
+
+    Penggantian berlaku HANYA sesama jenis. Sebelumnya kuncinya tanpa jenis, sehingga
+    banding ``remove`` dianggap menggantikan banding ``add`` pada baris yang sama —
+    padahal keduanya bukan dua versi dari permintaan yang sama, melainkan dua tahap
+    berurutan: ``add`` MEMBUAT barisnya, ``remove`` MENGHAPUS baris itu.
+
+    Akibat bug tersebut, begitu QC mengajukan penghapusan atas baris hasil ``add``,
+    banding ``add``-nya lenyap dari semua penyaring — barisnya hilang dari tabel
+    seketika padahal penghapusannya BARU DIAJUKAN (masih "menunggu"), lengkap dengan
+    hilangnya pengurangan skornya. Persis alur yang dianjurkan docstring
+    ``added_appeals_visible``: add ditolak -> baris tetap tampil -> QC mengajukan
+    ``remove`` untuk membersihkannya."""
     latest = {}
     for a in appeals or []:
-        key = (_appeal_attr(a, "error_code"), _appeal_attr(a, "item_code"))
-        latest[key] = a
+        latest[(*_appeal_row_key(a), _appeal_kind(a))] = a
     return list(latest.values())
+
+
+def _appeal_seq(appeal) -> int:
+    """Urutan pengajuan sebuah banding. ``id`` adalah serial yang naik terus, jadi
+    id lebih besar = diajukan belakangan. 0 bila tidak ada (objek belum tersimpan)."""
+    try:
+        return int(_appeal_attr(appeal, "id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _row_lifecycle(appeals: list) -> dict:
+    """Riwayat hidup tiap baris Error Code: ``key -> (id_hapus_disetujui, id_add_terbaru)``.
+
+    Sebuah baris bisa dihidupkan-dimatikan berkali-kali: ``add`` MEMBUAT baris,
+    ``remove``/``change`` yang disetujui MENGHAPUSNYA, lalu ``add`` lagi bisa
+    menghidupkannya kembali. Yang menentukan keadaan akhir adalah **mana yang
+    diajukan belakangan**, bukan sekadar ada/tidaknya salah satu:
+
+    - hapus disetujui SESUDAH add  -> barisnya hilang (add-nya batal);
+    - add SESUDAH hapus disetujui  -> barisnya hidup lagi (hapusnya sudah terpakai).
+
+    Tanpa perbandingan urutan ini, mengajukan ``add`` untuk kode yang penghapusannya
+    pernah disetujui tidak akan pernah memunculkan barisnya kembali — hilang diam-diam
+    walau bandingnya berstatus menunggu."""
+    removed, added = {}, {}
+    for a in appeals or []:
+        key = _appeal_row_key(a)
+        kind = _appeal_kind(a)
+        seq = _appeal_seq(a)
+        if kind == "add":
+            if seq >= added.get(key, -1):
+                added[key] = seq
+        elif effective_appeal_status(a) == "approved":  # remove / change
+            if seq >= removed.get(key, -1):
+                removed[key] = seq
+    return {k: (removed.get(k), added.get(k)) for k in set(removed) | set(added)}
+
+
+def _keys_removed_by_approval(appeals: list) -> set:
+    """Baris yang saat ini BENAR-BENAR terhapus: ada ``remove``/``change`` disetujui
+    yang diajukan SESUDAH ``add`` terakhirnya (kalau ada). Penghapusan yang masih
+    menunggu / ditolak tidak menghapus apa pun."""
+    return {
+        key for key, (removed_seq, added_seq) in _row_lifecycle(appeals).items()
+        if removed_seq is not None and (added_seq is None or removed_seq > added_seq)
+    }
+
+
+def _keys_revived_after_removal(appeals: list) -> set:
+    """Baris yang penghapusannya sudah TERPAKAI karena ada ``add`` yang lebih baru —
+    penghapusan itu tidak boleh lagi menjatuhkan barisnya."""
+    return {
+        key for key, (removed_seq, added_seq) in _row_lifecycle(appeals).items()
+        if removed_seq is not None and added_seq is not None and added_seq > removed_seq
+    }
 
 
 def approved_appeals_only(appeals: list) -> list:
     """Filter a list of appeals down to those whose current status is approved.
 
     An error code may be appealed repeatedly; only the latest appeal per
-    ``(error_code, item_code)`` is authoritative, so an older approved row that
-    was superseded by a newer pending/rejected one is ignored."""
-    return [a for a in _latest_per_key(appeals) if effective_appeal_status(a) == "approved"]
+    ``(error_code, item_code, jenis)`` is authoritative, so an older approved row that
+    was superseded by a newer pending/rejected one is ignored.
+
+    Penghapusan yang sudah TERPAKAI juga dikeluarkan: kalau baris itu diajukan ``add``
+    lagi SESUDAH penghapusannya disetujui, penghapusan lama tidak boleh menjatuhkan
+    baris yang baru dihidupkan (lihat ``_row_lifecycle``)."""
+    revived = _keys_revived_after_removal(appeals)
+    return [
+        a for a in _latest_per_key(appeals)
+        if effective_appeal_status(a) == "approved"
+        and not (_appeal_kind(a) in ("remove", "change") and _appeal_row_key(a) in revived)
+    ]
 
 
 def added_appeals_only(appeals: list) -> list:
     """Approved ``add`` bandings (latest per key). These attach a NEW error to an
-    evaluation item/field and lower the score (except source ``others``)."""
+    evaluation item/field and lower the score (except source ``others``).
+
+    Baris yang penghapusannya SUDAH DISETUJUI dikecualikan — barisnya memang sudah
+    tidak ada lagi, jadi pengurangan skornya ikut hilang."""
+    gone = _keys_removed_by_approval(appeals)
     return [
         a for a in _latest_per_key(appeals)
         if _appeal_kind(a) == "add" and effective_appeal_status(a) == "approved"
+        and _appeal_row_key(a) not in gone
     ]
 
 
@@ -725,10 +1046,15 @@ def added_appeals_visible(appeals: list) -> list:
     (applied), OR rejected. A rejected add stays visible (shown as ``rejected``)
     instead of vanishing — the QC keeps a record of the denied proposal and removes it
     later via a separate deletion request (a ``remove`` banding). It is display-only:
-    the score uses ``added_appeals_only`` (approved), so a rejected add never deducts."""
+    the score uses ``added_appeals_only`` (approved), so a rejected add never deducts.
+
+    Barisnya baru hilang setelah penghapusan itu DISETUJUI; selama penghapusannya
+    masih menunggu, barisnya tetap tampil dengan status banding "menunggu"."""
+    gone = _keys_removed_by_approval(appeals)
     return [
         a for a in _latest_per_key(appeals)
         if _appeal_kind(a) == "add" and effective_appeal_status(a) in ("pending", "approved", "rejected")
+        and _appeal_row_key(a) not in gone
     ]
 
 
@@ -938,13 +1264,256 @@ def is_cashline_code(error_code: str) -> bool:
     return any(x in ec for x in ("B02", "B03", "B05"))
 
 
+def _restore_scorecard_items(evaluation: dict, codes: set) -> dict:
+    """Flip the named scorecard items ``BELUM_SESUAI`` -> ``SESUAI`` (restoring full
+    weight). Shared mechanism for lifting a propagation-driven scorecard item when the
+    verification banding that caused it is approved. Non-destructive; only ever
+    restores the codes passed in, and never forces a BELUM_SESUAI."""
+    if not evaluation or not codes:
+        return evaluation
+    new_items = []
+    changed = False
+    for item in evaluation.get("scorecard_result") or []:
+        if (item or {}).get("item_code") in codes and (item or {}).get("status") == "BELUM_SESUAI":
+            updated = {**item, "status": "SESUAI"}
+            if item.get("weight") is not None:
+                updated["item_score"] = item.get("weight")
+            new_items.append(updated)
+            changed = True
+        else:
+            new_items.append(item)
+    return {**evaluation, "scorecard_result": new_items} if changed else evaluation
+
+
+def _card_holder_static_restore_codes(approved_appeals: list) -> set:
+    """Scorecard item_code(s) an approved Card Holder STATIC (B17) remove/change banding
+    must also restore. A static field (tanggal_lahir/nama_ibu_kandung) carries a 0
+    penalty on the card_holder row itself — its real deduction lives on the linked
+    scorecard item (SC_CL_23_1/SC_CL_23_2) and that item's critical check (VERIFICATION
+    -> SCORECARD PROPAGATION). Appealing the B17 away therefore has to lift the scorecard
+    item too, otherwise removing the only surfaced B17 row moves nothing. The banding's
+    own item_code is the field LABEL ("Tanggal Lahir"), so map it back via
+    ``CARD_HOLDER_STATIC_SCORECARD``. Dynamic fields map to the grouped SC_CL_24 and are
+    settled separately after the flip."""
+    labels = {titleize_field(f): c for f, c in CARD_HOLDER_STATIC_SCORECARD.items()}
+    out = set()
+    for a in approved_appeals or []:
+        if (_appeal_attr(a, "error_code") or "").strip().upper() != "B17":
+            continue
+        code = labels.get((_appeal_attr(a, "item_code") or "").strip())
+        if code:
+            out.add(code)
+    return out
+
+
+def _has_dynamic_card_holder_appeal(approved_appeals: list) -> bool:
+    """True when an approved B17 banding targets one of the 9 DYNAMIC card-holder
+    fields (item_code == titleized dynamic field). Used to gate the SC_CL_24 restore."""
+    labels = {titleize_field(f) for f in CARD_HOLDER_DYNAMIC_FIELDS}
+    return any(
+        (_appeal_attr(a, "error_code") or "").strip().upper() == "B17"
+        and (_appeal_attr(a, "item_code") or "").strip() in labels
+        for a in approved_appeals or []
+    )
+
+
+# Teks yang WAJIB muncul sebagai alasan tiket yang gugur di TAHAP 1 verifikasi statik
+# (penyebutan nasabah berubah-ubah antar pengulangan). Kebijakan 10 Agustus 2026:
+# jawaban yang berganti-ganti bukan sekadar salah data, melainkan indikasi fraud —
+# tiketnya Not Qualified dan tidak boleh singgah di PENDING/dokumen pendukung.
+FRAUD_REASON = "Indikasi Fraud"
+
+
+def _reason_says_inconsistent(reason) -> bool:
+    """True bila teks alasan menyatakan penyebutan nasabah TIDAK konsisten.
+
+    Sengaja mencari frasa negatifnya, bukan kata "konsisten" saja: alasan seperti
+    "Nasabah konsisten menyebut Zandra, tetapi tidak sama dengan Ascend" justru
+    kebalikannya — konsisten tapi gagal di TAHAP 2. Mencocokkan kata telanjang
+    membuat baris itu salah dibaca sebagai kegagalan tahap 1 (indikasi fraud)."""
+    text = str(reason or "").casefold()
+    return "tidak konsisten" in text or "inkonsisten" in text
+
+
+def _is_static_consistency_failure(row: dict) -> bool:
+    """True bila baris card_holder_verification ini gugur di CEK KONSISTENSI (tahap 1),
+    bukan karena tidak cocok dengan Ascend (tahap 2).
+
+    Penanda utamanya bendera ``consistency_failed`` dari prompt; hasil lama yang belum
+    punya bendera itu dikenali dari kata "konsisten" pada ``reason`` — konvensi yang
+    sama dengan ``static_verification_failure_reason`` dan normalisasi band."""
+    v = row or {}
+    if v.get("field") not in STATIC_CONSISTENCY_FIELDS:
+        return False
+    if (v.get("match") or "") != "MISMATCH":
+        return False
+    if v.get("consistency_failed") is True:
+        return True
+    return _reason_says_inconsistent(v.get("reason"))
+
+
+def static_consistency_failures(evaluation: dict) -> list:
+    """Label field statik yang gugur di tahap 1 (penyebutan tidak konsisten).
+
+    Kosong = tidak ada indikasi fraud dari aturan ini."""
+    out = []
+    for row in (evaluation or {}).get("card_holder_verification") or []:
+        if _is_static_consistency_failure(row):
+            out.append(STATIC_VERIFICATION_ITEMS_BY_FIELD.get((row or {}).get("field"))
+                       or titleize_field((row or {}).get("field")))
+    return out
+
+
+def normalize_static_verification(evaluation: dict) -> dict:
+    """Jadikan verifikasi STATIK card holder deterministik: hitung ulang
+    ``similarity_percent`` di Python, pilih penyebutan TERBAIK, lalu tegakkan
+    AMBANG DOKUMEN PENDUKUNG — tiga hal yang sebelumnya sepenuhnya bergantung pada
+    kepatuhan & ketelitian LLM.
+
+    1. **Similarity dihitung ulang** (``compliance.static_similarity``) dari
+       ``reference_value`` vs penyebutan nasabah. Angka LLM terbukti bisa meleset —
+       "ARNIYETTI" vs "Sarieti" pernah dilaporkan 44% padahal 56% — dan selisih
+       sebesar itu bisa memindahkan tiket melewati ambang 80 / 87,5.
+    2. **Penyebutan terbaik dipakai** (aturan TAHAP 2, KB v21 / prompt v50): setiap
+       elemen ``extracted_mentions`` diadu ke Ascend, yang tertinggi menjadi
+       ``extracted_value``. Seri dimenangkan yang paling baru.
+    3. **Ambang ditegakkan** seperti di bawah.
+
+    Aturannya (sama dengan ``compliance.documents.CARD_HOLDER_DOC_BANDS`` dan tabel
+    di prompt): ``nama_ibu_kandung`` >= 80 dan ``tanggal_lahir`` >= 87,5 adalah
+    **MATCH** — di zona abu-abu (di bawah ``match_min``) bank meminta dokumen
+    pendukung, bukan menyalahkan agent. Di bawah ambang itu MISMATCH.
+
+    DUA PENGECUALIAN, keduanya penting:
+
+    1. Baris yang gagal lewat STATIC VERIFICATION CONSISTENCY RULE tidak disentuh.
+       Pada baris itu ``similarity_percent`` berisi kemiripan ANTAR-PENYEBUTAN
+       nasabah, BUKAN kemiripan terhadap Ascend (lihat catatan yang sama di
+       ``compliance/documents.py``) — membacanya sebagai nilai band akan
+       "menyelamatkan" tiket yang justru gagal karena jawabannya berubah-ubah.
+       Dikenali dari kata "konsisten" pada ``reason``, penanda yang sama yang dipakai
+       ``static_verification_failure_reason``.
+    2. ``similarity_percent`` kosong (SKIPPED_NULL / tidak dilaporkan) — tidak ada
+       angka yang bisa dijadikan dasar, jadi vonis LLM dibiarkan.
+
+    Bila sebuah field statik dikoreksi menjadi MATCH, item scorecard 1:1-nya
+    (SC_CL_23_1 / SC_CL_23_2) ikut dipulihkan ke SESUAI — sama seperti yang dilakukan
+    banding B17 yang disetujui. Tanpa itu tabel verifikasi akan berbunyi MATCH
+    sementara skornya tetap dipotong.
+
+    Non-destruktif: mengembalikan evaluasi baru hanya bila ada yang berubah. Panggil
+    SEBELUM ``_propagate_verification_to_scorecard`` agar scorecard, skor, AI Status,
+    tabel Error Code, dan permintaan dokumen semuanya ikut nilai yang sudah dikoreksi.
+    """
+    if not evaluation:
+        return evaluation
+    items = evaluation.get("card_holder_verification")
+    if not isinstance(items, list) or not items:
+        return evaluation
+    from compliance.documents import CARD_HOLDER_DOC_BANDS
+    from compliance.static_similarity import best_static_match, mention_values
+
+    # --- 1 & 2: similarity dihitung ulang atas penyebutan TERBAIK ---------------
+    recomputed = []
+    touched = False
+    for it in items:
+        v = it or {}
+        field = v.get("field")
+        if field not in STATIC_CONSISTENCY_FIELDS or _is_static_consistency_failure(v):
+            # Gugur TAHAP 1: similarity-nya kemiripan ANTAR-PENYEBUTAN, bukan
+            # terhadap Ascend — tidak boleh dihitung ulang sebagai similarity Ascend.
+            recomputed.append(it)
+            continue
+        ref = v.get("reference_value")
+        if ref is None or str(ref).strip() == "":
+            recomputed.append(it)   # tanpa acuan tidak ada yang bisa dihitung
+            continue
+        # Kandidat = seluruh penyebutan nasabah DITAMBAH nilai pilihan LLM. Nilai LLM
+        # wajib ikut karena ia sudah dibersihkan (mis. gelar "Hajah" dibuang, lead-in
+        # phrase dipangkas) sedangkan penyebutan mentah belum: pada satu tiket acuan
+        # "AMINAH" cocok 100% dengan nilai LLM "Aminah" tapi hanya 50% dengan
+        # penyebutan mentah "Hajah Aminah". Karena yang dipilih adalah similarity
+        # TERTINGGI, ikut sertanya nilai LLM membuat hasilnya tidak pernah lebih
+        # buruk dari sebelumnya. Ditaruh PALING BELAKANG supaya menang saat seri
+        # (aturan seri: yang paling baru).
+        # mention_values() menerima objek ber-timestamp (v52) maupun string lama.
+        cands = mention_values(v.get("extracted_mentions"))
+        chosen = v.get("extracted_value")
+        if chosen not in (None, "") and chosen not in cands:
+            cands = [*cands, chosen]
+        best = best_static_match(field, ref, cands)
+        if best is None:
+            recomputed.append(it)
+            continue
+        value, score = best
+        if v.get("extracted_value") == value and v.get("similarity_percent") == score:
+            recomputed.append(it)
+            continue
+        recomputed.append({**v, "extracted_value": value, "similarity_percent": score})
+        touched = True
+    if touched:
+        evaluation = {**evaluation, "card_holder_verification": recomputed}
+        items = recomputed
+
+    # --- 3: ambang zona abu-abu ------------------------------------------------
+    new_items = []
+    changed = False
+    restore: set = set()
+    for it in items:
+        v = it or {}
+        rule = CARD_HOLDER_DOC_BANDS.get(v.get("field"))
+        sim = v.get("similarity_percent")
+        match = v.get("match")
+        if (
+            rule is None
+            or match not in ("MATCH", "MISMATCH")
+            or isinstance(sim, bool)
+            or not isinstance(sim, (int, float))
+            or _reason_says_inconsistent(v.get("reason"))
+        ):
+            new_items.append(it)
+            continue
+        want = "MATCH" if sim >= rule["doc_min"] else "MISMATCH"
+        if want == match:
+            new_items.append(it)
+            continue
+        new_items.append({**v, "match": want})
+        changed = True
+        if want == "MATCH":
+            code = CARD_HOLDER_STATIC_SCORECARD.get(v.get("field"))
+            if code:
+                restore.add(code)
+    if not changed:
+        return evaluation
+    result = {**evaluation, "card_holder_verification": new_items}
+    return _restore_scorecard_items(result, restore)
+
+
 def apply_approved_card_holder_appeals(evaluation: dict, approved_appeals: list) -> dict:
-    """Apply approved Card Holder Verification (B17) banding to ``evaluation``."""
-    return _apply_verification_appeals(
+    """Apply approved Card Holder Verification (B17) banding to ``evaluation``.
+
+    Beyond flipping the ``card_holder_verification`` field to MATCH, an approved STATIC
+    banding also restores its 1:1-linked scorecard item (tanggal_lahir -> SC_CL_23_1,
+    nama_ibu_kandung -> SC_CL_23_2). The static field's score lives entirely on that
+    scorecard item (0 penalty on the card_holder row, v33), which also drives its
+    Critical Compliance check — so without this restore, removing the only surfaced B17
+    row would leave the score, scorecard and critical check unchanged. A DYNAMIC banding
+    that lifts the KB_CL_24 verified count back to >= 2 restores the grouped SC_CL_24."""
+    result = _apply_verification_appeals(
         evaluation, approved_appeals, "card_holder_verification", lambda ec: ec == "B17",
         group_fields=CARD_HOLDER_DYNAMIC_FIELDS,
         group_score_fn=_card_holder_address_group_score,
     )
+    # STATIC: restore the 1:1 linked scorecard item(s) (critical check follows in
+    # apply_approved_critical_compliance_appeals, which also honours these codes).
+    result = _restore_scorecard_items(result, _card_holder_static_restore_codes(approved_appeals))
+    # DYNAMIC: once an approved dynamic banding pushes the verified count to >= 2, the
+    # <2-match SC_CL_24 propagation no longer holds, so restore that grouped item too.
+    if _has_dynamic_card_holder_appeal(approved_appeals) and card_holder_two_match_satisfied(
+        result.get("card_holder_verification")
+    ):
+        result = _restore_scorecard_items(result, {CARD_HOLDER_DYNAMIC_SCORECARD})
+    return result
 
 
 def apply_approved_cashline_appeals(evaluation: dict, approved_appeals: list) -> dict:
@@ -984,10 +1553,13 @@ def apply_approved_critical_compliance_appeals(evaluation: dict, approved_appeal
         for a in approved_appeals
         if _appeal_attr(a, "item_code")
     }
+    # Card Holder STATIC bandings resolve their critical check via the linked scorecard
+    # item (SC_CL_23_1/SC_CL_23_2), even though the banding's own item_code is the field
+    # LABEL ("Tanggal Lahir") rather than the SC_CL code. Mirrors the scorecard restore
+    # in apply_approved_card_holder_appeals so a removed B17 lifts the critical slice too.
+    approved_codes |= _card_holder_static_restore_codes(approved_appeals)
     # All four critical items are ordinary scorecard rows (SC_CL_4/23_1/23_2/37), so an
-    # approved scorecard appeal on that item_code resolves its critical slice. (Card-holder
-    # static failures now live on SC_CL_23_1/23_2 via propagation; to re-pass one, QC appeals
-    # that scorecard item directly — an approved B17 does NOT auto-restore it.)
+    # approved scorecard appeal on that item_code resolves its critical slice.
     orig_fail = sum(1 for it in items if (it or {}).get("status") == "FAIL")
     if orig_fail == 0:
         return evaluation
