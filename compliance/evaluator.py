@@ -25,12 +25,29 @@ def format_transcript_for_llm(messages: list[dict], source_files: list[str] | No
     ``speaker`` label is included on every line to help the model distinguish
     agent vs. customer (the actual role is still inferred by the LLM).
 
+    EVERY line also carries a ``[Pn]`` call tag, and (when ``source_files`` is
+    given) the transcript opens with a ``=== DAFTAR PANGGILAN ===`` legend mapping
+    each tag to its ticket_id. Reason (13 Agustus 2026): the ticket_id used to live
+    ONLY in the section header, so filling ``evidence.ticket_id`` meant remembering
+    a header that could be tens of thousands of characters up the page. It failed
+    exactly where you would predict — on ticket 030808fLO1 a quote 32.515 characters
+    below its header (but only ~51 lines above the NEXT header) was attributed to
+    the following call, while a quote 7.290 characters below the same header was
+    attributed correctly. An audit of 12 multi-call tickets found 2 more evidence
+    rows whose timestamp cannot exist in the call they name. With the tag on the
+    line itself the model no longer needs long-range memory: the answer sits in the
+    line it is quoting. Cost is ~5 characters per line (<3% of a large transcript).
+
     ``source_files`` (optional) is the chronologically-sorted filename list from
     ``build_transcript``; when provided, each call marker is enriched with the
     file name and the timestamp parsed from it.
     """
     lines: list[str] = []
     current_call = None
+
+    legend = _call_legend(messages, source_files)
+    if legend:
+        lines.extend(legend)
 
     for msg in messages:
         call_index = msg.get("call_index", 1)
@@ -41,9 +58,29 @@ def format_transcript_for_llm(messages: list[dict], source_files: list[str] | No
         speaker = msg.get("speaker") or "SPEAKER_?"
         timestamp = msg.get("timestamp", "")
         text = msg.get("text", "")
-        lines.append(f"[{speaker}] [{timestamp}] {text}")
+        lines.append(f"[P{call_index}] [{speaker}] [{timestamp}] {text}")
 
     return "\n".join(lines)
+
+
+def _call_legend(messages: list[dict], source_files: list[str] | None) -> list[str]:
+    """``=== DAFTAR PANGGILAN ===`` block: one ``Pn = <ticket_id>`` line per call.
+
+    Empty when there are no ``source_files`` — without filenames there is no
+    ticket_id to map a tag to, and an legend of bare numbers teaches nothing."""
+    if not source_files:
+        return []
+    seen = sorted({m.get("call_index", 1) for m in messages})
+    out = ["=== DAFTAR PANGGILAN (pakai tag [Pn] di tiap baris untuk mengisi evidence.ticket_id) ==="]
+    for idx in seen:
+        if not 1 <= idx <= len(source_files):
+            continue
+        filename = source_files[idx - 1]
+        ts = parse_filename_timestamp(filename)
+        when = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else "?"
+        out.append(f"P{idx} = {ticket_id_from_filename(filename)}   (waktu: {when})")
+    out.append("=== AKHIR DAFTAR PANGGILAN ===")
+    return out
 
 
 def _call_marker(call_index: int, source_files: list[str] | None) -> str:

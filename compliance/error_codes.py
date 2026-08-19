@@ -8,7 +8,8 @@ Sources:
   - Scorecard            : items BELUM_SESUAI (derived B10/B12/B18) + LLM ``error_codes``
   - Card Holder Verif.   : per-field MISMATCH -> B17 (SKIPPED_NULL carries no error)
   - Cashline Data Verif. : per-field MISMATCH -> B02/B03/B05 risk-graded (SKIPPED_NULL none)
-  - OCR document         : not yet assigned error codes (reserved for a future source)
+  - Dokumen pendukung    : B09 (tenggat H+2 lewat tanpa dokumen) & C03 (jenis
+                           dokumen salah) — lihat ``document_error_code_rows``
 """
 
 import re
@@ -20,6 +21,10 @@ from compliance.riplay import check_tms_against_tnc
 SOURCE_SCORECARD = "scorecard"
 SOURCE_CARD_HOLDER = "card_holder"
 SOURCE_CASHLINE = "cashline_data"
+# Dokumen pendukung (KTP/KK/NPWP/buku tabungan): B09 saat tenggat H+2 lewat tanpa
+# dokumen, C03 saat jenisnya keliru. Berdiri sendiri dari scorecard karena pemicunya
+# bukan transkrip melainkan berkas yang diunggah — atau tidak diunggah.
+SOURCE_DOCUMENT = "document"
 # "others" is a QC-add-only source (see appeal_kind='add'): an error code that does
 # not belong to any of the structured sources. It is display-only — it never has an
 # evaluation item/field to attach to, so it does not change the score.
@@ -29,119 +34,233 @@ SOURCE_LABELS = {
     SOURCE_SCORECARD: "Scorecard",
     SOURCE_CARD_HOLDER: "Card Holder Verification",
     SOURCE_CASHLINE: "Cashline Data Verification",
+    SOURCE_DOCUMENT: "Dokumen Pendukung",
     SOURCE_OTHERS: "Others",
 }
 
-# --- Catalog: code -> {desc (Indonesian), source, trigger (one-line note)} ---
-# This is the authoritative description/source map. Sourced from the scorecard
-# prompt's error-code catalog (example_final/Cashline/prompt_cashline_mus_v21.txt).
+# --- Catalog: code -> {desc, error_type, error_category, source, trigger, risk_base} ---
+#
+# ``desc`` / ``error_type`` / ``error_category`` / ``risk_base`` DISALIN APA ADANYA dari
+# sheet resmi QC — "Error Reason - Telemarketing QC_05082025.xlsx", kolom Details Error /
+# Error Type / Error Categories / Risk Base (lihat ``csv_bank/``). Sengaja tidak
+# ditulis ulang dengan kalimat sendiri (permintaan 14 Agustus 2026): sheet itulah
+# kosakata yang dipakai QC sehari-hari, dan wording tandingan membuat dua pihak
+# menyebut kesalahan yang sama dengan nama berbeda. Kalau sheet-nya diperbarui,
+# perbarui blok ini — jangan mengarang padanan baru.
+#
+# ``source`` dan ``trigger`` TIDAK ada di sheet: keduanya milik sistem ini, yaitu dari
+# blok evaluasi mana sebuah kode terbit dan pada kondisi apa.
 ERROR_CODES = {
     "B02": {
-        "desc": "Salah input data — risiko rendah",
+        "desc": "Salah input data dengan risiko low yang berakibat pada kesalahan proses transaksi",
+        "error_type": "Error - Human",
+        "error_category": "Data Input",
         "source": SOURCE_CASHLINE,
         "trigger": "Field cashline_data_verification MISMATCH/SKIPPED_NULL — risiko rendah",
         "risk_base": "L",
     },
     "B03": {
-        "desc": "Salah input data — risiko menengah (data finansial)",
+        "desc": "Salah input data dengan risiko medium yang berakibat pada kesalahan proses transaksi",
+        "error_type": "Error - Human",
+        "error_category": "Data Input",
         "source": SOURCE_CASHLINE,
         "trigger": "Field cashline_data_verification MISMATCH/SKIPPED_NULL — risiko menengah (data finansial)",
         "risk_base": "M",
     },
     "B05": {
-        "desc": "Salah input data — risiko tinggi (potensi kerugian finansial)",
+        "desc": "Salah input data dengan risiko tinggi yang dapat berakibat financial loss",
+        "error_type": "Error - Human",
+        "error_category": "Data Input",
         "source": SOURCE_CASHLINE,
         "trigger": "Field cashline_data_verification MISMATCH/SKIPPED_NULL — risiko tinggi",
         "risk_base": "H",
     },
+    # Tidak diterbitkan sistem: salah jenis dokumen memakai C03 (lihat di bawah).
+    # Tetap dikatalogkan karena B08 ada di sheet — daftar ini menggambarkan kosakata
+    # QC, bukan hanya kode yang kebetulan terbit.
+    "B08": {
+        "desc": "Type File Doc. terlampir kurang/tidak sesuai",
+        "error_type": "Error - Human",
+        "error_category": "Dokumen Pendukung",
+        "source": SOURCE_DOCUMENT,
+        "trigger": "(tidak diterbitkan sistem — lihat C03)",
+        "risk_base": "L",
+    },
+    # Tenggat H+2 lewat tanpa dokumen. Dibebankan ke AGENT (Error - Human, Risk Base
+    # M) meski berkasnya sendiri datang dari nasabah: yang dinilai bukan siapa yang
+    # membuat berkas, melainkan kelalaian menagih kelengkapan sampai tenggatnya
+    # habis. Bandingkan dengan C03 — di sana berkasnya DATANG, hanya keliru jenis,
+    # dan keliru memilih berkas memang pekerjaan nasabah.
+    "B09": {
+        "desc": "Doc Unclear/ Buram / Tidak Jelas/ Expired/Tidak Melampirkan Doc pendukung",
+        "error_type": "Error - Human",
+        "error_category": "Dokumen Pendukung",
+        "source": SOURCE_DOCUMENT,
+        "trigger": "Tenggat H+2 lewat dan dokumen pendukung yang diminta belum diunggah",
+        "risk_base": "M",
+    },
     "B10": {
-        "desc": "Fitur/skrip/biaya produk tidak akurat",
+        "desc": "Inaccurate Product Feature/Script/Fee",
+        "error_type": "Error - Human",
+        "error_category": "TnC Product",
         "source": SOURCE_SCORECARD,
         "trigger": ("Item BELUM_SESUAI di kategori Penjelasan Mega Cashline, "
                     "Final Konfirmasi Mega Cashline, atau Final Konfirmasi Mega Ultima Shield"),
         "risk_base": "M",
     },
     "B11": {
-        "desc": "Pelanggaran aturan produk",
+        "desc": "Ketentuan Pembelian Product (Subscription Requirement)",
+        "error_type": "Error - Human",
+        "error_category": "TnC Product",
         "source": SOURCE_SCORECARD,
         "trigger": "Pelanggaran aturan produk pada transkrip",
         "risk_base": "M",
     },
     "B12": {
-        "desc": "Pelanggaran skrip standar pembukaan",
+        "desc": ("Agent tidak menyebutkan nama, tidak menyebutkan dari Bank mega atau "
+                 "hal lain yang berhubungan dengan standard script"),
+        "error_type": "Error - Human",
+        "error_category": "Probbing",
         "source": SOURCE_SCORECARD,
         "trigger": "Item BELUM_SESUAI di kategori Greeting (SC_CL_1/2/3)",
         "risk_base": "L",
     },
     "B13": {
-        "desc": "Pengungkapan data verifikasi sebelum nasabah",
+        "desc": "Voice Mistake",
+        "error_type": "Error - Human",
+        "error_category": "Voice Mistake",
         "source": SOURCE_SCORECARD,
         "trigger": "Pengungkapan data verifikasi dinamis sebelum nasabah",
         "risk_base": "M",
     },
     "B15": {
-        "desc": "Pengungkapan data verifikasi statik sebelum nasabah",
+        "desc": "Open data yang termasuk data statik namun belum verifikasi",
+        "error_type": "Error - Human",
+        "error_category": "Open Data",
         "source": SOURCE_SCORECARD,
         "trigger": "Agen mengungkap data statik (SC_CL_23_1/23_2) sebelum nasabah",
         "risk_base": "H",
     },
     "B16": {
-        "desc": "Verifikasi dinamis tidak memadai",
+        "desc": "Verfikasi Statik Berhasil, Verifikasi Dinamik kurang/tidak sesuai",
+        "error_type": "Error - Human",
+        "error_category": "Verification",
         "source": SOURCE_SCORECARD,
         "trigger": "SC_CL_23_1 & 23_2 SESUAI tetapi SC_CL_24 BELUM_SESUAI",
         "risk_base": "M",
     },
     "B17": {
-        "desc": "Verifikasi statik/dinamis tidak ada atau tidak sesuai",
+        "desc": "Tidak ada Verifikasi/ verifikasi statik kurang/tidak berhasil",
+        "error_type": "Error - Human",
+        "error_category": "Verification",
         "source": SOURCE_CARD_HOLDER,
         "trigger": "Field card_holder_verification MISMATCH/SKIPPED_NULL, atau SC_CL_23 BELUM_SESUAI",
         "risk_base": "H",
     },
     "B18": {
-        "desc": "Tidak ada legal statement / pernyataan persetujuan",
+        "desc": "Tidak Ada Legal Statement",
+        "error_type": "Error - Human",
+        "error_category": "Legal Statement",
         "source": SOURCE_SCORECARD,
         "trigger": "Item BELUM_SESUAI di kategori Legal Statement (SC_CL_37/38)",
         "risk_base": "H",
     },
     "B19": {
-        "desc": "Janji di luar kewenangan",
+        "desc": "Menjanjikan hal-hal diluar kewenangan",
+        "error_type": "Error - Human",
+        "error_category": "Over Promise",
         "source": SOURCE_SCORECARD,
         "trigger": "Janji di luar kewenangan pada transkrip",
         "risk_base": "M",
     },
     "B20": {
-        "desc": "Penawaran tidak ditujukan kepada pemegang kartu utama",
+        "desc": "Offering bukan kepada CH",
+        "error_type": "Error - Human",
+        "error_category": "Offering bukan kepada CH",
         "source": SOURCE_SCORECARD,
         "trigger": "Penawaran tidak ditujukan kepada pemegang kartu utama",
         "risk_base": "H",
     },
     "B24": {
-        "desc": "Nasabah membatalkan kartu suplemen namun proses tetap dilanjutkan",
+        "desc": "Customer Cancel Supplement (crosselling), namun sudah tersubmit",
+        "error_type": "Error - Human",
+        "error_category": "TnC Product",
         "source": SOURCE_SCORECARD,
         "trigger": "Pembatalan kartu suplemen tetapi proses tetap dilanjutkan",
         "risk_base": "L",
     },
     "B26": {
-        "desc": "Nasabah mengajukan syarat/kondisi untuk menerima penawaran",
+        "desc": "Legal Statement Bersyarat",
+        "error_type": "Error - Human",
+        "error_category": "Legal Statement",
         "source": SOURCE_SCORECARD,
         "trigger": "Nasabah mengajukan syarat/kondisi untuk menerima penawaran",
         "risk_base": "M",
+    },
+    # Salah jenis dokumen (14 Agustus 2026): berkasnya DATANG, hanya bukan jenis yang
+    # diminta — mis. KTP diunggah ke slot NPWP.
+    #
+    # Dipakai deret C, bukan B08, karena dokumen pendukung adalah berkas yang
+    # diserahkan NASABAH; memilih berkas yang keliru adalah kegagalan sisi nasabah.
+    # Karena itu Error Type "Error - Customer" dan Risk Base O (System) — TIDAK masuk
+    # Total Risk, jadi tidak menaikkan Error Rate siapa pun.
+    #
+    # Batasnya dengan B09 sengaja tegas: C03 soal berkas yang SALAH, B09 soal berkas
+    # yang TIDAK PERNAH DATANG sampai tenggat. Yang kedua tetap tanggungan agent,
+    # karena menagih kelengkapan sebelum tenggat habis adalah pekerjaannya.
+    #
+    # Angka risk_base disalin dari sheet dan tidak boleh menyimpang. Kalau salah
+    # jenis dokumen suatu saat harus membebani agent, yang diubah adalah KODENYA
+    # (ke B08, Risk Base L), bukan risk_base C03.
+    "C03": {
+        "desc": "Doc Unclear/ Buram / Tidak Jelas/ Expired/Tidak Melampirkan Doc pendukung",
+        "error_type": "Error - Customer",
+        "error_category": "Dokumen Pendukung",
+        "source": SOURCE_DOCUMENT,
+        "trigger": "Dokumen yang diunggah bukan jenis yang diminta pada slot tersebut",
+        "risk_base": "O",
     },
 }
 
 # Flat code -> Indonesian description (kept for convenience / imports).
 ERROR_DESC_ID = {code: meta["desc"] for code, meta in ERROR_CODES.items()}
 
+
+def error_type_of(code) -> str:
+    """Kolom "Error Type" pada sheet QC, mis. ``"Error - Human"``. Kosong bila kode
+    tidak ada di katalog (termasuk kode gabungan ``"B02/B03/B05"``)."""
+    return (ERROR_CODES.get(code) or {}).get("error_type") or ""
+
+
+def error_category_of(code) -> str:
+    """Kolom "Error Categories" pada sheet QC, mis. ``"Data Input"``."""
+    return (ERROR_CODES.get(code) or {}).get("error_category") or ""
+
 # New-joiner rule: when a submission's agent joined < 18 days before submit_time,
 # each Error Code whose Risk Base is L or M is softened to this value (H is kept).
 NEW_JOINER_RISK_BASE = "N"
 
 
+# Kode yang TIDAK ikut dilunakkan aturan new joiner (keputusan 14 Agustus 2026).
+# Pelunakan itu memaafkan kesalahan yang wajar dilakukan agent yang belum
+# berpengalaman di TELEPON. Urusan dokumen pendukung bukan soal itu: masa kerja
+# tidak mengubah tenggat H+2, jadi B09 tetap M.
+#
+# Untuk C03 aturannya tidak pernah menggigit (Risk Base O, sementara yang dilunakkan
+# hanya L/M). Tetap didaftarkan sebagai pernyataan NIAT, supaya keputusan ini tidak
+# hilang diam-diam kalau risk_base-nya suatu saat berubah.
+NEW_JOINER_EXEMPT_CODES = {"B09", "C03"}
+
+
 def override_risk_base_for_new_joiner(rows: list) -> list:
     """Return error-code rows with Risk Base ``L``/``M`` replaced by ``N`` (the
-    new-joiner rule); rows with any other Risk Base (e.g. ``H``) are unchanged."""
+    new-joiner rule); rows with any other Risk Base (e.g. ``H``) are unchanged, and
+    so are the document codes in ``NEW_JOINER_EXEMPT_CODES``."""
     return [
-        {**r, "risk_base": NEW_JOINER_RISK_BASE} if r.get("risk_base") in ("L", "M") else r
+        {**r, "risk_base": NEW_JOINER_RISK_BASE}
+        if (r.get("risk_base") in ("L", "M")
+            and r.get("error_code") not in NEW_JOINER_EXEMPT_CODES)
+        else r
         for r in rows
     ]
 
@@ -168,7 +287,8 @@ CATEGORY_ERROR_CODES = [
 # Reversible: widen this set (or remove the filter in build_error_code_table) to
 # restore a hidden code. Hidden codes carry no score deduction, so hiding them does
 # not change any score or pass/fail outcome.
-ALLOWED_ERROR_CODES = {"B02", "B03", "B05", "B10", "B12", "B16", "B17", "B18"}
+ALLOWED_ERROR_CODES = {"B02", "B03", "B05", "B09", "B10", "B12", "B16",
+                       "B17", "B18", "C03"}
 
 
 def is_allowed_error_code(code: str) -> bool:
@@ -512,6 +632,82 @@ def _split_qc_evidence(text) -> tuple:
     return ts, s[m.end():].strip()
 
 
+def _document_row(code: str, reason: str) -> dict:
+    """Satu baris tabel Error Code bersumber dokumen pendukung.
+
+    Bentuknya harus sama persis dengan baris keluaran ``build_error_code_table``
+    (lihat ``add`` di sana) karena keduanya bercampur dalam satu tabel dan
+    dikonsumsi pemakai yang sama — dashboard, export XLSX, dan tally Risk Base.
+
+    ``item_code`` kosong: pemicunya berkas yang diunggah, bukan item scorecard.
+    Konsekuensinya baris ini tidak pernah dianggap "L yang tolerable" oleh
+    ``compliance.stats_aggregate.top_risk_base`` — dan itu benar, telat melengkapi
+    dokumen bukan pelanggaran skrip yang bisa dimaklumi.
+    """
+    return {
+        "sumber": SOURCE_LABELS[SOURCE_DOCUMENT],
+        "error_code": code,
+        "risk_base": (ERROR_CODES.get(code) or {}).get("risk_base") or "",
+        "error_type": error_type_of(code),
+        "error_category": error_category_of(code),
+        "item_code": "",
+        "details_error": ERROR_DESC_ID.get(code) or "",
+        "reason": reason,
+        "evidence": "",
+        "timestamp": "",
+        "evidence_quote": "",
+        "ticket_id": "",
+    }
+
+
+def document_error_code_rows(missing=False, missing_labels=(), wrong_type=()) -> list:
+    """Baris Error Code untuk urusan dokumen pendukung. DUA kode, dibedakan oleh
+    siapa yang gagal:
+
+      * berkas tidak pernah datang sampai tenggat  -> B09, Error - Human, Risk M
+      * berkas datang tapi salah jenis             -> C03, Error - Customer, Risk O
+
+    ``missing``         — dokumen yang diminta tidak pernah diunggah sampai tenggat
+                          H+2 lewat. Terbit B09, SATU baris saja walau yang kurang
+                          lebih dari satu berkas: yang dinilai adalah kelalaian
+                          menagih kelengkapan, bukan jumlah berkasnya.
+    ``missing_labels``  — jenis dokumen yang kurang, mis. ``["KK"]``, hanya untuk
+                          memperjelas kalimat alasan. Boleh kosong: kewajiban yang
+                          lahir dari perubahan data TMS / limit >= 50 juta bisa
+                          dipenuhi dokumen apa pun, jadi tidak ada jenis yang bisa
+                          disebut. Mengisi ini TIDAK menggantikan ``missing``.
+    ``wrong_type``      — dokumen yang diunggah tetapi jenisnya bukan yang diminta,
+                          tiap item ``{"expected": <label>, "detected": <label>}``.
+                          Terbit C03, satu baris per slot yang keliru, karena tiap
+                          slot adalah kesalahan unggah tersendiri.
+
+    Sebuah tiket bisa kena KEDUANYA — slot NPWP diisi KTP (C03), sehingga kewajiban
+    NPWP-nya tetap kosong dan tenggat lewat (B09). Itu memang dua fakta yang berbeda
+    dan sengaja dilaporkan terpisah. Tally Risk Base tidak berlipat: tiap tiket tetap
+    dihitung satu risk base tertinggi saja — dalam contoh itu M dari B09.
+    """
+    rows = []
+    labels = [str(l).strip() for l in (missing_labels or []) if str(l or "").strip()]
+    if missing:
+        rows.append(_document_row(
+            "B09",
+            ("Dokumen " + ", ".join(labels) if labels else "Dokumen pendukung")
+            + " tidak diunggah sampai tenggat H+2 terlewat",
+        ))
+    for item in wrong_type or []:
+        expected = str((item or {}).get("expected") or "").strip()
+        detected = str((item or {}).get("detected") or "").strip()
+        if not expected:
+            continue
+        rows.append(_document_row(
+            "C03",
+            f"Dokumen yang diminta {expected}, "
+            + (f"yang diunggah terbaca sebagai {detected}" if detected
+               else "yang diunggah bukan dokumen tersebut"),
+        ))
+    return rows
+
+
 def build_error_code_table(evaluation: dict) -> list:
     """Build the grouped Error Code table rows from an LLM ``evaluation`` object.
 
@@ -537,6 +733,10 @@ def build_error_code_table(evaluation: dict) -> list:
             "sumber": SOURCE_LABELS.get(source, source),
             "error_code": code or "",
             "risk_base": (ERROR_CODES.get(code) or {}).get("risk_base") or "",
+            # Kosakata sheet QC, dibawa per baris supaya dashboard & export tidak
+            # perlu memetakan kode ke kategorinya sendiri-sendiri.
+            "error_type": error_type_of(code),
+            "error_category": error_category_of(code),
             "item_code": item_code or "",
             "details_error": ERROR_DESC_ID.get(code) or details or "",
             "reason": strip_item_codes(reason),
@@ -1127,7 +1327,14 @@ def _propagate_verification_to_scorecard(evaluation: dict) -> dict:
 
     Only ever forces BELUM_SESUAI (item_score 0); a MATCH / >=2-match never restores a
     SESUAI (to re-pass, QC appeals the scorecard item directly). Non-destructive; does not
-    itself recompute ai_score_phase_2 (callers re-derive the score from scorecard_result)."""
+    itself recompute ai_score_phase_2 (callers re-derive the score from scorecard_result).
+
+    ``reason`` item yang dipaksa turun ikut ditulis ulang: teks aslinya ditulis LLM
+    untuk menjelaskan status SESUAI ("nasabah menjawab dengan nama yang konsisten"),
+    jadi membiarkannya membuat tabel Scorecard berbunyi BELUM_SESUAI dengan alasan
+    yang justru menyatakan item itu terpenuhi. Sumber kalimatnya sama dengan kolom
+    Reason tabel Error Code (``static_verification_failure_reason``) supaya kedua
+    permukaan tidak bisa berbunyi berbeda untuk kegagalan yang sama."""
     if not evaluation:
         return evaluation
     ch = evaluation.get("card_holder_verification") or []
@@ -1145,8 +1352,19 @@ def _propagate_verification_to_scorecard(evaluation: dict) -> dict:
     new_items = []
     changed = False
     for it in evaluation.get("scorecard_result") or []:
-        if (it or {}).get("item_code") in force_belum and (it or {}).get("status") != "BELUM_SESUAI":
-            new_items.append({**it, "status": "BELUM_SESUAI", "item_score": 0})
+        code = (it or {}).get("item_code")
+        if code in force_belum and (it or {}).get("status") != "BELUM_SESUAI":
+            updated = {**it, "status": "BELUM_SESUAI", "item_score": 0}
+            # Static: sebutkan SEBAB sebenarnya (tidak ditanya / tidak konsisten /
+            # mismatch Ascend). Dynamic SC_CL_24 tidak punya satu field penyebab —
+            # yang gagal adalah aturan minimal 2 parameter terverifikasi.
+            reason = static_verification_failure_reason(code, evaluation)
+            if reason is None and code == CARD_HOLDER_DYNAMIC_SCORECARD:
+                reason = (f"Kurang dari {CARD_HOLDER_DYNAMIC_REQUIRED} parameter "
+                          f"verifikasi dinamis yang terverifikasi (aturan KB_CL_24)")
+            if reason:
+                updated["reason"] = reason
+            new_items.append(updated)
             changed = True
         else:
             new_items.append(it)
@@ -1364,6 +1582,78 @@ def static_consistency_failures(evaluation: dict) -> list:
     return out
 
 
+def fraud_fail_reason(evaluation: dict) -> "str | None":
+    """Komentar AI Status untuk tiket yang gugur karena indikasi fraud, atau None.
+
+    Satu-satunya sumber kalimat itu, dipakai bersama oleh kolom AI Status di daftar
+    Results dan sheet ringkasan pada export XLSX — dulu kalimatnya ditulis ulang di
+    tempat pemakaian, yang membuat kedua permukaan bisa berbunyi berbeda untuk tiket
+    yang sama. Sejajar dengan ``compliance.badwords.badword_fail_reason``."""
+    fields = static_consistency_failures(evaluation)
+    if not fields:
+        return None
+    return f"{FRAUD_REASON} — penyebutan {', '.join(fields)} tidak konsisten antar pengulangan"
+
+
+def _format_percent(value) -> str:
+    """Persentase untuk teks reason, gaya Indonesia: 67 -> "67%", 87.5 -> "87,5%".
+    String kosong bila angkanya tidak terbaca."""
+    if isinstance(value, bool) or value is None:
+        return ""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if num != num:  # NaN
+        return ""
+    if num == int(num):
+        return f"{int(num)}%"
+    return f"{num:g}".replace(".", ",") + "%"
+
+
+def _static_band_reason(row: dict, rule: dict) -> str:
+    """Kalimat ``reason`` deterministik untuk satu baris verifikasi STATIK, ditulis
+    dari angka yang SUDAH dihitung ulang Python.
+
+    Perlu karena ``normalize_static_verification`` menimpa ``extracted_value``,
+    ``similarity_percent`` dan ``match`` tetapi teks ``reason``-nya ditulis LLM untuk
+    vonisnya sendiri. Pada tiket 020338gGlU baris ``nama_ibu_kandung`` berbunyi "masih
+    di atas ambang match Ascend" padahal similarity hasil hitung ulang 67% (MISMATCH):
+    kalimat yang bertolak belakang dengan kolom Match di sebelahnya membuat QC tidak
+    bisa mempercayai keduanya, dan kalimat itu ikut terbawa ke kolom Reason tabel
+    Error Code.
+
+    Mengikuti pola yang diminta prompt (AMBANG DOKUMEN PENDUKUNG): nilai yang disebut,
+    nilai Ascend, persentase, lalu tindak lanjut. Dua larangan kata dipatuhi:
+
+    - di zona abu-abu kata "sesuai"/"cocok" TIDAK dipakai — nilainya memang belum
+      sama, itu justru sebabnya dokumen diminta;
+    - "tidak konsisten"/"inkonsisten" TIDAK pernah muncul. Frasa itu penanda
+      kegagalan TAHAP 1 (indikasi fraud) yang dibaca ``_reason_says_inconsistent``,
+      sedangkan baris yang sampai ke sini justru sudah LOLOS tahap 1 dan gugur di
+      tahap 2. Menuliskannya akan membuat tiket salah divonis fraud.
+    """
+    from compliance.documents import DOCUMENT_TYPES
+
+    label = rule["label"]
+    sim = row.get("similarity_percent")
+    ext = str(row.get("extracted_value") or "").strip()
+    ref = str(row.get("reference_value") or "").strip()
+    if not ext:
+        return (f"{label} tidak disebut nasabah sehingga data Ascend "
+                f"tidak terverifikasi.")
+    ref_part = f', Ascend "{ref}"' if ref else ""
+    detail = f'{label} disebut "{ext}"{ref_part} — mirip {_format_percent(sim)}'
+    if sim >= rule["match_min"]:
+        return f"{detail}, sesuai Ascend."
+    if sim >= rule["doc_min"]:
+        doc = DOCUMENT_TYPES.get(rule["doc_type"], {}).get(
+            "label", str(rule["doc_type"]).upper())
+        return f"{detail}, perlu verifikasi dokumen {doc}."
+    return (f"{detail}, di bawah ambang {_format_percent(rule['doc_min'])} "
+            f"sehingga mismatch dengan Ascend.")
+
+
 def normalize_static_verification(evaluation: dict) -> dict:
     """Jadikan verifikasi STATIK card holder deterministik: hitung ulang
     ``similarity_percent`` di Python, pilih penyebutan TERBAIK, lalu tegakkan
@@ -1378,6 +1668,10 @@ def normalize_static_verification(evaluation: dict) -> dict:
        elemen ``extracted_mentions`` diadu ke Ascend, yang tertinggi menjadi
        ``extracted_value``. Seri dimenangkan yang paling baru.
     3. **Ambang ditegakkan** seperti di bawah.
+    4. **``reason`` ditulis ulang** (``_static_band_reason``) untuk setiap baris yang
+       angkanya kita ubah. Tanpa ini baris yang sudah dikoreksi tetap membawa kalimat
+       LLM yang menjelaskan vonis LAMA — tiket 020338gGlU berbunyi "masih di atas
+       ambang match Ascend" tepat di sebelah kolom Match yang berbunyi MISMATCH.
 
     Aturannya (sama dengan ``compliance.documents.CARD_HOLDER_DOC_BANDS`` dan tabel
     di prompt): ``nama_ibu_kandung`` >= 80 dan ``tanggal_lahir`` >= 87,5 adalah
@@ -1414,9 +1708,13 @@ def normalize_static_verification(evaluation: dict) -> dict:
     from compliance.static_similarity import best_static_match, mention_values
 
     # --- 1 & 2: similarity dihitung ulang atas penyebutan TERBAIK ---------------
+    # ``dirty`` = indeks baris yang angka/vonisnya kita ubah; hanya baris itu yang
+    # ``reason``-nya ditulis ulang di tahap 4. Baris yang angkanya sudah benar
+    # dibiarkan apa adanya supaya kalimat LLM yang informatif (menyebut evidence,
+    # cara nasabah mengeja, dsb) tidak tergantikan template yang lebih miskin.
     recomputed = []
-    touched = False
-    for it in items:
+    dirty: set = set()
+    for idx, it in enumerate(items):
         v = it or {}
         field = v.get("field")
         if field not in STATIC_CONSISTENCY_FIELDS or _is_static_consistency_failure(v):
@@ -1450,16 +1748,15 @@ def normalize_static_verification(evaluation: dict) -> dict:
             recomputed.append(it)
             continue
         recomputed.append({**v, "extracted_value": value, "similarity_percent": score})
-        touched = True
-    if touched:
+        dirty.add(idx)
+    if dirty:
         evaluation = {**evaluation, "card_holder_verification": recomputed}
         items = recomputed
 
     # --- 3: ambang zona abu-abu ------------------------------------------------
     new_items = []
-    changed = False
     restore: set = set()
-    for it in items:
+    for idx, it in enumerate(items):
         v = it or {}
         rule = CARD_HOLDER_DOC_BANDS.get(v.get("field"))
         sim = v.get("similarity_percent")
@@ -1469,6 +1766,14 @@ def normalize_static_verification(evaluation: dict) -> dict:
             or match not in ("MATCH", "MISMATCH")
             or isinstance(sim, bool)
             or not isinstance(sim, (int, float))
+            # Gugur TAHAP 1: ``similarity_percent``-nya kemiripan ANTAR-PENYEBUTAN,
+            # bukan terhadap Ascend — membacanya sebagai nilai band akan
+            # "menyelamatkan" tiket yang justru gagal karena jawabannya berubah-ubah,
+            # dan tahap 4 akan menimpa kalimat "Indikasi Fraud"-nya. Bendera
+            # ``consistency_failed`` (prompt v52) ikut dibaca lewat
+            # ``_is_static_consistency_failure``; cek teks dipertahankan untuk hasil
+            # lama yang belum punya bendera itu.
+            or _is_static_consistency_failure(v)
             or _reason_says_inconsistent(v.get("reason"))
         ):
             new_items.append(it)
@@ -1478,14 +1783,30 @@ def normalize_static_verification(evaluation: dict) -> dict:
             new_items.append(it)
             continue
         new_items.append({**v, "match": want})
-        changed = True
+        dirty.add(idx)
         if want == "MATCH":
             code = CARD_HOLDER_STATIC_SCORECARD.get(v.get("field"))
             if code:
                 restore.add(code)
-    if not changed:
+    if not dirty:
         return evaluation
-    result = {**evaluation, "card_holder_verification": new_items}
+
+    # --- 4: reason ditulis ulang dari angka final -------------------------------
+    final = []
+    for idx, it in enumerate(new_items):
+        v = it or {}
+        rule = CARD_HOLDER_DOC_BANDS.get(v.get("field"))
+        sim = v.get("similarity_percent")
+        if (
+            idx not in dirty
+            or rule is None
+            or isinstance(sim, bool)
+            or not isinstance(sim, (int, float))
+        ):
+            final.append(it)
+            continue
+        final.append({**v, "reason": _static_band_reason(v, rule)})
+    result = {**evaluation, "card_holder_verification": final}
     return _restore_scorecard_items(result, restore)
 
 
@@ -1726,19 +2047,30 @@ def _apply_added_verification_appeals(
 
 def apply_added_score_appeals(evaluation: dict, added_appeals: list) -> dict:
     """Apply ALL score-affecting ``add`` bandings (scorecard + both verifications +
-    critical) in one call. ``others`` adds carry no score effect (display only). Use
-    this in every read-time assembly path (detail view, Results list, XLSX, aggregates)
-    so the score/AI-status stays consistent everywhere."""
-    if not evaluation or not added_appeals:
+    critical) in one call, THEN derive the scorecard/critical items that follow from
+    the resulting verification state. ``others`` adds carry no score effect (display
+    only). Use this in every read-time assembly path (detail view, Results list, XLSX,
+    aggregates) so the score/AI-status stays consistent everywhere.
+
+    VERIFICATION -> SCORECARD PROPAGATION berjalan SELALU, ada banding ``add`` atau
+    tidak. Dulu ia ikut terjaga di balik ``if not added_appeals: return`` sehingga —
+    pada mayoritas tiket, yang memang tidak punya banding — sebuah field statik
+    MISMATCH tidak pernah menurunkan SC_CL_23_1/23_2. Akibatnya tiket 020338gGlU
+    menampilkan B17 "Nama Ibu Kandung MISMATCH" di tabel Error Code sementara
+    SC_CL_23_2-nya tetap SESUAI 15 poin dan AI Status-nya tetap PASS: error yang
+    terlihat tapi tidak pernah dipotong. Propagasi ini turunan murni dari keadaan
+    verifikasi, jadi tempatnya memang di luar cabang banding."""
+    if not evaluation:
         return evaluation
-    evaluation = apply_added_scorecard_appeals(evaluation, added_appeals)
-    evaluation = apply_added_card_holder_appeals(evaluation, added_appeals)
-    evaluation = apply_added_cashline_appeals(evaluation, added_appeals)
-    # A card-holder add flips a static/dynamic field to MISMATCH; propagate that into the
-    # scorecard (SC_CL_23_1/23_2/SC_CL_24) BEFORE the critical applier so the critical
-    # entry for a now-BELUM_SESUAI SC_CL_23_x flips to FAIL consistently.
+    if added_appeals:
+        evaluation = apply_added_scorecard_appeals(evaluation, added_appeals)
+        evaluation = apply_added_card_holder_appeals(evaluation, added_appeals)
+        evaluation = apply_added_cashline_appeals(evaluation, added_appeals)
+    # Jalankan SEBELUM applier kritis: sebuah field statik yang MISMATCH (entah dari
+    # evaluasi LLM, dari hitung ulang Python, atau dari banding 'add') menurunkan
+    # SC_CL_23_1/23_2, dan item kritis yang baru turun itu harus ikut FAIL.
     evaluation = _propagate_verification_to_scorecard(evaluation)
-    evaluation = apply_added_critical_compliance_appeals(evaluation, added_appeals)
+    evaluation = _sync_critical_compliance(evaluation, added_appeals)
     return evaluation
 
 
@@ -1764,20 +2096,27 @@ def apply_added_card_holder_appeals(evaluation: dict, added_appeals: list) -> di
 CRITICAL_ITEM_CODES = ("SC_CL_4", "SC_CL_23_1", "SC_CL_23_2", "SC_CL_37")
 
 
-def apply_added_critical_compliance_appeals(evaluation: dict, added_appeals: list) -> dict:
-    """When a scorecard ``add`` targets a critical item, flip its
-    ``critical_compliance_check`` entry ``PASS`` -> ``FAIL`` and add one frozen slice
-    (``-(maximum_score/4)``) back to ``ai_score_critical_compliance_check`` — the
-    inverse of ``apply_added_scorecard_appeals``'s counterpart. Non-destructive.
+def _sync_critical_compliance(evaluation: dict, added_appeals: list) -> dict:
+    """Selaraskan ``critical_compliance_check`` dengan scorecard: setiap item kritis
+    (``CRITICAL_ITEM_CODES``) yang BELUM_SESUAI harus berentri ``FAIL``, dan tiap
+    entri yang baru jatuh menambah satu iris beku (``-(maximum_score/4)``) ke
+    ``ai_score_critical_compliance_check``. Non-destruktif.
 
-    Also handles card-holder adds: an added card-holder banding flips a static field
-    ``MATCH`` -> ``MISMATCH`` (via ``apply_added_card_holder_appeals``), then
-    ``_propagate_verification_to_scorecard`` forces the matching ``SC_CL_23_1``/``SC_CL_23_2``
-    to ``BELUM_SESUAI`` (both run before this in ``apply_added_score_appeals``). That critical
-    scorecard item is picked up here via ``belum_critical`` and flips ``PASS`` -> ``FAIL``,
-    gaining a frozen slice — so a QC-added static mismatch triggers the score bomb just like
-    an LLM-detected one."""
-    if not evaluation or not added_appeals:
+    Dua sumber item kritis yang jatuh, keduanya ditangani di sini:
+
+    1. Banding ``add`` pada item scorecard kritis — kebalikan dari pasangannya di
+       ``apply_added_scorecard_appeals``.
+    2. VERIFICATION -> SCORECARD PROPAGATION: field statik MISMATCH menurunkan
+       SC_CL_23_1/23_2 lewat ``_propagate_verification_to_scorecard`` (jalan tepat
+       sebelum fungsi ini). Sumbernya tidak dibedakan — MISMATCH hasil hitung ulang
+       Python memicu score bomb yang sama dengan MISMATCH temuan LLM atau tambahan QC.
+
+    Sebelumnya fungsi ini ikut terjaga di balik ``if not added_appeals: return``,
+    padahal sebab (2) tidak ada hubungannya dengan banding. Efeknya tiket tanpa
+    banding bisa berakhir tidak konsisten: scorecard BELUM_SESUAI tetapi entri
+    kritisnya PASS. Karena itu ia kini jalan setiap kali ada item kritis yang
+    BELUM_SESUAI; bila tidak ada yang perlu dibalik, fungsi ini no-op."""
+    if not evaluation:
         return evaluation
     ccc = evaluation.get("critical_compliance_check")
     if not isinstance(ccc, dict):
@@ -1787,12 +2126,9 @@ def apply_added_critical_compliance_appeals(evaluation: dict, added_appeals: lis
         return evaluation
     added_codes = {
         _appeal_attr(a, "item_code")
-        for a in added_appeals
+        for a in (added_appeals or [])
         if _appeal_attr(a, "add_source") == SOURCE_SCORECARD and _appeal_attr(a, "item_code")
     }
-    # Critical scorecard items (SC_CL_23_1/23_2) forced BELUM_SESUAI by an added card-holder
-    # static banding — via _propagate_verification_to_scorecard, which runs before this in
-    # apply_added_score_appeals. Their critical entry must flip PASS -> FAIL too.
     belum_critical = {
         (it or {}).get("item_code")
         for it in (evaluation.get("scorecard_result") or [])

@@ -38,8 +38,44 @@ ITEM_REQUIRED = ["field", "acuan", "document", "similarity", "match", "reason"]
 REQUIRED = ["verifications"]
 
 
+# Jenis dokumen yang BENAR-BENAR terbaca, terlepas dari slot mana ia diunggah.
+# Tanpa ini, mengunggah KTP ke slot NPWP hanya menghasilkan ``document=null,
+# match=false`` — tidak bisa dibedakan dari "NPWP-nya ada tetapi nomornya salah",
+# padahal keduanya kesalahan yang berbeda (sheet QC: C03 vs B02/B03/B05).
+# Nilainya dibatasi supaya bisa dibandingkan langsung dengan slot yang diminta;
+# "LAINNYA" untuk dokumen di luar keempat jenis, "TIDAK_JELAS" bila memang tidak
+# terbaca — yang kedua sengaja TIDAK dianggap salah jenis (lihat
+# ``compliance.documents.wrong_document_type``).
+DOC_KIND_VALUES = ["KTP", "KK", "NPWP", "COVER_BUKU_TABUNGAN", "LAINNYA", "TIDAK_JELAS"]
+DOC_KIND_KEY = "jenis_dokumen"
+
+DOC_KIND_PROP = {
+    "type": "string",
+    "enum": DOC_KIND_VALUES,
+    "description": (
+        "Jenis dokumen yang benar-benar terlihat pada berkas ini, apa adanya — "
+        "JANGAN mengikuti jenis yang diminta pada instruksi."
+    ),
+}
+
+# Ditempelkan ke setiap prompt OCR agar instruksinya seragam antar jenis dokumen.
+DOC_KIND_INSTRUCTION = (
+    "\n\nIDENTIFIKASI JENIS DOKUMEN (WAJIB):\n"
+    "- Selain tugas di atas, tentukan jenis dokumen yang BENAR-BENAR terlihat pada "
+    "berkas ini dan tulis pada field '" + DOC_KIND_KEY + "'.\n"
+    "- Nilai yang boleh dipakai: " + ", ".join(DOC_KIND_VALUES) + ".\n"
+    "- Nilai ini menggambarkan APA YANG ANDA LIHAT, bukan jenis yang diminta di atas. "
+    "Bila berkasnya ternyata dokumen lain, sebutkan jenis aslinya (atau LAINNYA); "
+    "jangan menyesuaikannya dengan permintaan.\n"
+    "- Pakai TIDAK_JELAS hanya bila berkasnya tidak terbaca sama sekali.\n"
+    "- Bila jenisnya bukan yang diminta, tetap isi verifications: document=null, "
+    "match=false, dan jelaskan di reason bahwa dokumennya bukan jenis yang diminta."
+)
+
+
 def make_props() -> dict:
-    """Top-level schema properties: a ``verifications`` array of comparison rows."""
+    """Top-level schema properties: a ``verifications`` array of comparison rows,
+    plus the detected document kind."""
     return {
         "verifications": {
             "type": "array",
@@ -50,7 +86,8 @@ def make_props() -> dict:
                 "required": ITEM_REQUIRED,
                 "additionalProperties": False,
             },
-        }
+        },
+        DOC_KIND_KEY: DOC_KIND_PROP,
     }
 
 
@@ -63,7 +100,9 @@ def make_schema(name: str) -> dict:
             "schema": {
                 "type": "object",
                 "properties": make_props(),
-                "required": REQUIRED,
+                # ``strict`` menuntut setiap properti ada di ``required``; tanpa itu
+                # jenis_dokumen boleh dihilangkan model dan deteksi C03 mati diam-diam.
+                "required": REQUIRED + [DOC_KIND_KEY],
                 "additionalProperties": False,
             },
             "strict": True,

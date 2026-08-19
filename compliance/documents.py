@@ -228,6 +228,53 @@ def build_ocr_request(doc_type: str, reference: dict | None = None) -> tuple[str
     Returns ``(prompt, schema)`` where ``prompt`` is the per-type prompt with the
     reference ("acuan") values injected and ``schema`` is the strict JSON
     ``document_annotation_format``.
+
+    Instruksi identifikasi jenis dokumen ditempelkan DI SINI, bukan di tiap modul
+    prompt: kalimatnya sama untuk keempat jenis, dan menyalinnya empat kali adalah
+    empat kesempatan untuk lupa memperbaruinya. Ditempel SESUDAH ``build_prompt``
+    supaya tidak ikut ``str.format`` yang mengisi nilai acuan.
     """
+    from prompt._common import DOC_KIND_INSTRUCTION
+
     module = load_prompt_module(doc_type)
-    return module.build_prompt(reference or {}), module.SCHEMA
+    return module.build_prompt(reference or {}) + DOC_KIND_INSTRUCTION, module.SCHEMA
+
+
+# Slot dokumen -> nilai ``jenis_dokumen`` yang dianggap BENAR untuk slot itu.
+# Cermin dari ``prompt._common.DOC_KIND_VALUES``.
+_DOC_KIND_EXPECTED = {
+    "ktp": "KTP",
+    "kk": "KK",
+    "npwp": "NPWP",
+    "cover_buku_tabungan": "COVER_BUKU_TABUNGAN",
+}
+
+
+def wrong_document_type(doc_type: str, ocr_json) -> "dict | None":
+    """``{"expected", "detected"}`` bila dokumen yang diunggah ke slot ``doc_type``
+    ternyata jenis lain; None bila cocok atau tidak bisa dipastikan.
+
+    Tidak dianggap salah jenis — sengaja, semuanya berarti "tidak tahu", dan
+    menerbitkan error code atas ketidaktahuan lebih buruk daripada melewatkannya:
+
+      * ``TIDAK_JELAS``  — berkasnya tidak terbaca. Itu keluhan mutu berkas, bukan
+        salah jenis; menuduh agent mengunggah dokumen keliru berdasarkan berkas yang
+        tidak terbaca adalah tuduhan tanpa bukti.
+      * field ``jenis_dokumen`` tidak ada — hasil OCR dari sebelum field ini
+        diperkenalkan. Dokumen lama tidak boleh tiba-tiba melahirkan error code baru.
+      * slot yang tidak dikenal katalog.
+    """
+    from prompt._common import DOC_KIND_KEY
+
+    expected = _DOC_KIND_EXPECTED.get(doc_type)
+    if expected is None or not isinstance(ocr_json, dict):
+        return None
+    detected = str(ocr_json.get(DOC_KIND_KEY) or "").strip().upper()
+    if not detected or detected == "TIDAK_JELAS" or detected == expected:
+        return None
+    label = DOCUMENT_TYPES.get(doc_type, {}).get("label", doc_type.upper())
+    detected_label = next(
+        (v["label"] for k, v in DOCUMENT_TYPES.items() if _DOC_KIND_EXPECTED.get(k) == detected),
+        detected.replace("_", " ").title(),
+    )
+    return {"expected": label, "detected": detected_label}

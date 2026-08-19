@@ -1094,6 +1094,29 @@ def result_document_types(db: Session, result_id: str) -> set[str]:
     return document_types_by_result(db, [result_id]).get(str(result_id), set())
 
 
+def document_ocr_by_result(db: Session, result_ids: list[str]) -> dict[str, list[tuple]]:
+    """``result_id -> [(doc_type, ocr_json), ...]`` untuk dokumen yang OCR-nya
+    selesai. Satu query — dipakai agregasi statistik yang memeriksa kesesuaian jenis
+    dokumen (error code C03) untuk ratusan tiket sekaligus.
+
+    Hanya dokumen ``done`` yang dikembalikan: yang masih ``pending``/``processing``
+    belum punya ``ocr_json``, dan yang ``failed`` tidak bisa dijadikan dasar tuduhan
+    salah jenis.
+    """
+    if not result_ids:
+        return {}
+    uuids = [uuid.UUID(str(r)) for r in result_ids]
+    rows = (
+        db.query(Document.result_id, Document.doc_type, Document.ocr_json)
+        .filter(Document.result_id.in_(uuids), Document.status == "done")
+        .all()
+    )
+    out: dict[str, list[tuple]] = {}
+    for rid, doc_type, ocr_json in rows:
+        out.setdefault(str(rid), []).append((doc_type, ocr_json))
+    return out
+
+
 def document_upload_times(db: Session, result_ids: list[str]) -> dict[str, datetime]:
     """Return ``{result_id: latest document created_at}`` for the given results.
 
