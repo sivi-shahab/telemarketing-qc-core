@@ -2,9 +2,9 @@
 and org hierarchy (Team Leader / Area Manager).
 
 The active sales database (uploaded via "Upload Database Sales") is read from
-MinIO once and parsed into a ``{USER ID -> {name, join_date, team_leader,
-area_manager}}`` map, cached by the database's ``object_path`` (a new upload has a
-new path, so the cache self-invalidates).
+MinIO once and parsed into a ``{USER ID -> {name, name_online, join_date,
+team_leader, area_manager}}`` map, cached by the database's ``object_path`` (a new
+upload has a new path, so the cache self-invalidates).
 
 The org hierarchy is read from the sales-marketing sheet's ``NAMA TL`` (column I)
 and ``NAMA AM`` (column K) columns — matched by header, falling back to the fixed
@@ -16,13 +16,13 @@ scoping NIPs come from ``NIP TL`` (column H), ``NIP AM`` (column J) and ``NIP BA
 ``JOIN POSISI (DD/MM/YYYY)`` (matched by ``agent_id`` == ``USER ID``) is
 < ``NEW_JOINER_THRESHOLD_DAYS`` days.
 """
-import io
 from datetime import date, datetime
 from typing import Optional
 
-from openpyxl import load_workbook
-
 from core_config import get_core_settings, get_minio
+# Pembacaan sheet-nya hidup di compliance/ supaya worker bisa ikut memakainya tanpa
+# menarik FastAPI — lihat compliance/sales_roster.py.
+from compliance.sales_roster import JOIN_FORMATS as _JOIN_FORMATS, norm as _norm, parse_roster, to_date as _to_date
 from db import crud
 
 NEW_JOINER_THRESHOLD_DAYS = 18
@@ -33,91 +33,19 @@ _cache = {"key": None, "map": {}}
 
 # tms_cashline.submit_time strings look like "2026-06-17 15:24:53".
 _SUBMIT_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d")
-# JOIN POSISI cells are usually datetimes; when a string, they look like "31/10/2017".
-_JOIN_FORMATS = ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d")
-
-
-def _norm(value) -> str:
-    """Trimmed string for header/cell matching; an integer-valued float loses its
-    ``.0`` so a numeric USER ID like ``801.0`` matches ``"801"`` ('' for None)."""
-    if value is None:
-        return ""
-    if isinstance(value, float) and value.is_integer():
-        value = int(value)
-    return str(value).strip()
-
-
-# Kolom roster jarang dikosongkan — yang tidak ada isinya diberi PLACEHOLDER:
-# 12 baris padding di akhir sheet memakai USER ID "0" / NIP "00000000" / nama "-",
-# dan agen berstatus MUTASI kehilangan atasannya dengan cara yang sama (NIP TL &
-# NIP TLM "0", NAMA TL & NAMA AM "-"). Placeholder BUKAN identitas orang: dibiarkan
-# apa adanya, NIP AM "0" + NAMA AM "-" menjadi satu opsi "-" di dropdown Semua AM
-# (idem Semua TL) dan baris padding menjadi satu "agent" hantu.
-_PLACEHOLDERS = {"-", "--", "n/a", "na", "none", "null", "#n/a", "#ref!"}
-
-
-def _person(value) -> str:
-    """``_norm``, tapi placeholder roster ("-", "0", "00000000", …) jadi ''."""
-    s = _norm(value)
-    if not s or s.casefold() in _PLACEHOLDERS:
-        return ""
-    return "" if set(s) == {"0"} else s
-
-
-def _to_date(value, formats) -> "date | None":
-    """Coerce a datetime/date/string cell into a ``date`` (None if unparseable)."""
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    s = str(value).strip()
-    if not s:
-        return None
-    for fmt in formats:
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-
-# Sales-marketing hierarchy columns: matched by header first, else fixed position.
-# Column I = "NAMA TL" (index 8, Team Leader), column K = "NAMA AM" (index 10, Area
-# Manager). See the "Update Sales Telemarketing …xlsx" layout.
-_TL_HEADER = "nama tl"
-_AM_HEADER = "nama am"
-_TL_FALLBACK_IDX = 8   # column I
-_AM_FALLBACK_IDX = 10  # column K
-# Sales-agent (Team Leader) login scoping: NIP TL = column H (idx 7), the NIP of the
-# agent's team leader; DEDICATED = column F (idx 5), the campaign the agent handles.
-_NIP_TL_HEADER = "nip tl"
-_DEDICATED_HEADER = "dedicated"
-_NIP_TL_FALLBACK_IDX = 7  # column H
-_DEDICATED_FALLBACK_IDX = 5  # column F
-# Area Manager login scoping: NIP AM = column J (idx 9), the NIP of the agent's area
-# manager (one level above the Team Leader), paired with column K = NAMA AM. In the
-# "Update Sales Telemarketing …" sheet column J is labelled "NIP TLM", so accept both
-# that header and "NIP AM"; fall back to the fixed column J when neither is present.
-_NIP_AM_HEADERS = ("nip am", "nip tlm")
-_NIP_AM_FALLBACK_IDX = 9  # column J
-# QC (agent) login scoping: NIP BARU = column C (idx 2), the agent's own NIP.
-_NIP_BARU_HEADER = "nip baru"
-_NIP_BARU_FALLBACK_IDX = 2  # column C
 
 
 def active_sales_map(db) -> dict:
-    """Return ``{USER ID (casefold) -> {"name", "join_date", "team_leader",
-    "area_manager", "nip_tl", "nip_am", "dedicated", "nip_baru"}}`` from the active
-    sales-database xlsx, or ``{}`` when there is none / it can't be read/parsed."""
+    """Return ``{USER ID (casefold) -> {"name", "name_online", "join_date",
+    "team_leader", "area_manager", "nip_tl", "nip_am", "dedicated", "nip_baru"}}``
+    from the active sales-database xlsx, or ``{}`` when there is none / it can't be
+    read/parsed."""
     row = crud.get_active_sales_database(db)
     if row is None:
         return {}
     if _cache["key"] == row.object_path:
         return _cache["map"]
 
-    mapping: dict = {}
     try:
         settings = get_core_settings()
         resp = get_minio().get_object(settings.minio_bucket_sales_database, row.object_path)
@@ -126,72 +54,7 @@ def active_sales_map(db) -> dict:
         finally:
             resp.close()
             resp.release_conn()
-        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-        ws = wb.active
-        rows = ws.iter_rows(values_only=True)
-        header = next(rows, None)
-        if header:
-            norm = [_norm(h).casefold() for h in header]
-            uid_i = next((i for i, h in enumerate(norm) if h in ("user id", "user_id", "userid")), None)
-            name_i = next((i for i, h in enumerate(norm) if h == "name"), None)
-            join_i = next((i for i, h in enumerate(norm) if h.startswith("join posisi")), None)
-            # Team Leader / Area Manager: match by header, else fixed column I / K.
-            tl_i = next((i for i, h in enumerate(norm) if h == _TL_HEADER), None)
-            if tl_i is None and len(norm) > _TL_FALLBACK_IDX:
-                tl_i = _TL_FALLBACK_IDX
-            am_i = next((i for i, h in enumerate(norm) if h == _AM_HEADER), None)
-            if am_i is None and len(norm) > _AM_FALLBACK_IDX:
-                am_i = _AM_FALLBACK_IDX
-            # NIP TL (col H) + DEDICATED (col F): match by header, else fixed column.
-            niptl_i = next((i for i, h in enumerate(norm) if h == _NIP_TL_HEADER), None)
-            if niptl_i is None and len(norm) > _NIP_TL_FALLBACK_IDX:
-                niptl_i = _NIP_TL_FALLBACK_IDX
-            ded_i = next((i for i, h in enumerate(norm) if h == _DEDICATED_HEADER), None)
-            if ded_i is None and len(norm) > _DEDICATED_FALLBACK_IDX:
-                ded_i = _DEDICATED_FALLBACK_IDX
-            # NIP AM (col J, header "NIP TLM"/"NIP AM"): the agent's area manager NIP —
-            # an area_manager login's username.
-            nipam_i = next((i for i, h in enumerate(norm) if h in _NIP_AM_HEADERS), None)
-            if nipam_i is None and len(norm) > _NIP_AM_FALLBACK_IDX:
-                nipam_i = _NIP_AM_FALLBACK_IDX
-            # NIP BARU (col C): the agent's own NIP — a qc login's username.
-            nipbaru_i = next((i for i, h in enumerate(norm) if h == _NIP_BARU_HEADER), None)
-            if nipbaru_i is None and len(norm) > _NIP_BARU_FALLBACK_IDX:
-                nipbaru_i = _NIP_BARU_FALLBACK_IDX
-            if uid_i is not None:
-                for r in rows:
-                    if not r or uid_i >= len(r):
-                        continue
-                    # Semua kolom identitas dibaca lewat _person(), bukan _norm():
-                    # placeholder roster harus jadi kosong SEBELUM tersimpan, supaya
-                    # tidak ada konsumen (dropdown filter, hierarki Statistics,
-                    # scoping login) yang perlu tahu soal "-" dan "0".
-                    uid = _person(r[uid_i])
-                    if not uid:
-                        continue  # baris padding "0" — bukan agent
-                    name = _person(r[name_i]) if (name_i is not None and name_i < len(r)) else ""
-                    join_date = (
-                        _to_date(r[join_i], _JOIN_FORMATS)
-                        if (join_i is not None and join_i < len(r))
-                        else None
-                    )
-                    team_leader = _person(r[tl_i]) if (tl_i is not None and tl_i < len(r)) else ""
-                    area_manager = _person(r[am_i]) if (am_i is not None and am_i < len(r)) else ""
-                    nip_tl = _person(r[niptl_i]) if (niptl_i is not None and niptl_i < len(r)) else ""
-                    dedicated = _person(r[ded_i]) if (ded_i is not None and ded_i < len(r)) else ""
-                    nip_am = _person(r[nipam_i]) if (nipam_i is not None and nipam_i < len(r)) else ""
-                    nip_baru = _person(r[nipbaru_i]) if (nipbaru_i is not None and nipbaru_i < len(r)) else ""
-                    mapping[uid.casefold()] = {
-                        "name": name or None,
-                        "join_date": join_date,
-                        "team_leader": team_leader or None,
-                        "area_manager": area_manager or None,
-                        "nip_tl": nip_tl or None,
-                        "nip_am": nip_am or None,
-                        "dedicated": dedicated or None,
-                        "nip_baru": nip_baru or None,
-                    }
-        wb.close()
+        mapping = parse_roster(data)
     except Exception:
         mapping = {}
 

@@ -278,9 +278,11 @@ def cashline_doc_requirements(result_json) -> list[dict]:
     (``[{"field", "doc_type", "similarity", "label"}]``) supaya kedua sumber
     kewajiban bisa disatukan pemanggilnya tanpa perlakuan khusus.
 
-    Hanya baris ``MISMATCH`` yang memicu. Berbeda dari verifikasi statik yang
-    zona abu-abunya ditulis ``MATCH``, di sini bank memutuskan zona bawah tetap
-    MISMATCH — skor tetap dipotong DAN dokumen tetap diminta.
+    Dipicu baris ``MISMATCH`` DAN ``PENDING``. Berbeda dari verifikasi statik yang
+    zona abu-abunya ditulis ``MATCH``, di sini zona bawah tetap MISMATCH — skor tetap
+    dipotong DAN dokumen tetap diminta. ``PENDING`` adalah keadaan antara sejak
+    31 Agustus 2026: dokumen sudah diminta dan tenggat H+2 masih berjalan, jadi
+    permintaannya harus tetap muncul.
     """
     evaluation = _evaluation_of(result_json)
     if evaluation is None:
@@ -293,7 +295,11 @@ def cashline_doc_requirements(result_json) -> list[dict]:
         if not isinstance(item, dict):
             continue
         rule = _CASHLINE_DOC_FIELDS.get(item.get("field"))
-        if rule is None or item.get("match") != "MISMATCH":
+        # ``PENDING`` ikut memicu (31 Agustus 2026): sejak baris cashline yang menunggu
+        # dokumen ditulis PENDING oleh ``apply_cashline_document_status``, membatasi
+        # pemicu pada MISMATCH akan membuat permintaan dokumennya HILANG tepat setelah
+        # penangguhan dimulai — dokumen berhenti diminta justru selama masa tunggunya.
+        if rule is None or item.get("match") not in ("MISMATCH", "PENDING"):
             continue
         found.setdefault(item["field"], {
             "field": item["field"],

@@ -6,7 +6,9 @@ which injects ``evaluation.error_code_table``) and the XLSX export.
 
 Sources:
   - Scorecard            : items BELUM_SESUAI (derived B10/B12/B18) + LLM ``error_codes``
-  - Card Holder Verif.   : per-field MISMATCH -> B17 (SKIPPED_NULL carries no error)
+  - Card Holder Verif.   : per-field MISMATCH -> B17 (SKIPPED_NULL carries no error;
+                           baris dinamis yang salah satu sisi pembandingnya kosong
+                           diturunkan ke SKIPPED_NULL — normalize_dynamic_verification)
   - Cashline Data Verif. : per-field MISMATCH -> B02/B03/B05 risk-graded (SKIPPED_NULL none)
   - Dokumen pendukung    : B09 (tenggat H+2 lewat tanpa dokumen) & C03 (jenis
                            dokumen salah) — lihat ``document_error_code_rows``
@@ -563,6 +565,24 @@ def _tidy_number(value: float):
     return int(value) if value == int(value) else round(value, 2)
 
 
+def _pending_reason_text(items) -> "str | None":
+    """Alasan penangguhan sebuah kategori, dirangkai dari item-item PENDING-nya.
+
+    Kalimatnya diambil dari ``reason`` item — yang pada jalur penangguhan sudah ditulis
+    ulang oleh propagasi menjadi teks baris verifikasinya ("...; menunggu dokumen Cover
+    Buku Tabungan sampai tenggat H+2"), jadi Ringkasan Kategori berbunyi sama dengan
+    tabel verifikasi dan tabel Scorecard untuk penangguhan yang sama. Duplikat dibuang
+    dan tiap kalimat dipastikan berakhiran titik."""
+    out, seen = [], set()
+    for it in items:
+        text = str((it or {}).get("reason") or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text if text.endswith((".", "!", "?")) else text + ".")
+    return " ".join(out) or None
+
+
 def derive_category_summary(evaluation: dict) -> dict:
     """Rebuild ``evaluation.category_summary`` from ``scorecard_result``.
 
@@ -578,8 +598,23 @@ def derive_category_summary(evaluation: dict) -> dict:
       - ``earned_score``    = total_weight - weights of its BELUM_SESUAI items, i.e. the
                               same arithmetic as ai_score_phase_2;
       - ``category_result`` = FAIL when the category has >= 1 BELUM_SESUAI item,
-                              ``TIDAK_DINILAI`` when EVERY item is skipped, else PASS;
-      - ``fail_reason``     = the LLM's prose, kept ONLY when the category really fails.
+                              ``TIDAK_DINILAI`` when EVERY item is skipped, PENDING when
+                              >= 1 item masih ditangguhkan, else PASS;
+      - ``fail_reason``     = the LLM's prose bila kategorinya gagal; bila kategorinya
+                              PENDING, alasan penangguhan item-itemnya.
+
+    STATUS PENDING IKUT DIRINGKAS (31 Agustus 2026). Sejak item scorecard bisa
+    ditangguhkan menunggu dokumen (SC_CL_23_1/23_2 lewat
+    ``_propagate_verification_to_scorecard``, SC_CL_13 lewat
+    ``_propagate_cashline_to_scorecard``), kategori yang membawa item PENDING terbaca
+    **PASS dengan nilai penuh** di Ringkasan Kategori — satu-satunya permukaan yang
+    meringkas scorecard per kategori justru menyembunyikan bahwa tiketnya sedang
+    menunggu bukti. FAIL tetap menang atas PENDING: sekali ada item yang sudah pasti
+    gagal, kategorinya gagal, sama seperti di kedua fungsi propagasi.
+
+    ``earned_score`` TIDAK berubah karena PENDING: penangguhan tidak memotong skor
+    (lihat ``scoring.scorecard_score``), jadi bobot item PENDING tetap utuh — persis
+    seperti angka yang dipakai ``ai_score_phase_2``.
 
     ITEM ``TIDAK_DINILAI`` TIDAK IKUT DIHITUNG (perbaikan 24 Agustus 2026). Item MUS
     dilewati ketika nasabah tidak berminat Mega Ultima Shield (MUS SCORECARD
@@ -618,7 +653,7 @@ def derive_category_summary(evaluation: dict) -> dict:
         if cat not in agg:
             order.append(cat)
             agg[cat] = {"weight": 0.0, "lost": 0.0, "failed": 0,
-                        "skipped": 0, "assessed": 0}
+                        "skipped": 0, "assessed": 0, "pending": []}
         bucket = agg[cat]
         status = str(it.get("status") or "").strip().upper()
         if status == "TIDAK_DINILAI":
@@ -632,6 +667,10 @@ def derive_category_summary(evaluation: dict) -> dict:
         if status == "BELUM_SESUAI":
             bucket["lost"] += w
             bucket["failed"] += 1
+        elif status == "PENDING":
+            # Bobotnya SUDAH ikut terhitung penuh di atas — penangguhan tidak memotong.
+            # Yang disimpan hanya alasannya, untuk kolom Alasan.
+            bucket["pending"].append(it)
     summary = []
     for cat in order:
         b = agg[cat]
@@ -640,18 +679,27 @@ def derive_category_summary(evaluation: dict) -> dict:
         # adanya (bukan disembunyikan) supaya QC tetap melihat kategori itu ADA dan
         # tahu mengapa nihil, bukan mengira laporannya terpotong.
         skipped_all = b["assessed"] == 0 and b["skipped"] > 0
+        pending = not failed and bool(b["pending"])
         if skipped_all:
             result = "TIDAK_DINILAI"
         elif failed:
             result = "FAIL"
+        elif pending:
+            result = "PENDING"
         else:
             result = "PASS"
+        if failed:
+            reason = old_reason.get(cat) or None
+        elif pending:
+            reason = _pending_reason_text(b["pending"])
+        else:
+            reason = None
         summary.append({
             "category": cat,
             "total_weight": _tidy_number(b["weight"]),
             "earned_score": _tidy_number(b["weight"] - b["lost"]),
             "category_result": result,
-            "fail_reason": (old_reason.get(cat) or None) if failed else None,
+            "fail_reason": reason,
         })
     return {**evaluation, "category_summary": summary}
 
@@ -854,6 +902,138 @@ def document_error_code_rows(missing=False, missing_labels=(), wrong_type=()) ->
     return rows
 
 
+# Pemisah antar item_code yang digabung menjadi SATU baris Error Code. Dipakai dua
+# arah: menyusunnya di ``merge_dynamic_verification_rows`` dan memecahnya kembali di
+# ``_apply_verification_appeals`` supaya satu banding pada baris gabungan tetap
+# mengenai SEMUA field yang diwakilinya.
+MERGED_ITEM_SEP = ", "
+
+
+def _merge_reason_texts(rows) -> str:
+    """Gabungkan ``reason`` beberapa baris menjadi satu paragraf.
+
+    Kalimat yang sama persis tidak diulang, dan tiap kalimat dipastikan diakhiri
+    titik supaya sambungannya terbaca sebagai paragraf, bukan satu kalimat panjang.
+    Nama field TIDAK ditambahkan di depan: kalimat dari LLM sudah menyebutnya sendiri
+    ("Alamat kantor yang disebut berbeda dengan Ascend ..."), jadi memprefiksnya
+    hanya akan mengulang.
+    """
+    out, seen = [], set()
+    for r in rows:
+        text = str((r or {}).get("reason") or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text if text.endswith((".", "!", "?")) else text + ".")
+    return " ".join(out)
+
+
+def _merge_verification_rows(group: list) -> dict:
+    """Satukan beberapa baris Error Code sejenis menjadi satu baris.
+
+    ``item_code`` menjadi daftar label yang digabung ``MERGED_ITEM_SEP`` — inilah
+    kunci yang dipakai banding, dan ``_apply_verification_appeals`` memecahnya lagi
+    saat menerapkan hasil banding. ``reference_value``/``extracted_value`` ikut
+    digabung DENGAN label fieldnya, karena tanpa label sepasang nilai dari tiga field
+    berbeda tidak bisa dibaca lagi di modal Manual Check.
+
+    Baris pertama menjadi kerangkanya, sehingga posisi, ``sumber``, ``risk_base``,
+    dan ``error_type``-nya tidak berubah.
+    """
+    base = dict(group[0])
+    labels = [str((r or {}).get("item_code") or "").strip() for r in group]
+    labels = [x for x in labels if x]
+    base["item_code"] = MERGED_ITEM_SEP.join(labels)
+    base["reason"] = _merge_reason_texts(group)
+    # Evidence: pakai yang pertama yang benar-benar terisi (baris B17 umumnya kosong).
+    for key in ("evidence", "timestamp", "evidence_quote", "ticket_id"):
+        base[key] = next(
+            (str((r or {}).get(key) or "").strip() for r in group
+             if str((r or {}).get(key) or "").strip()),
+            base.get(key) or "",
+        )
+    for key in ("reference_value", "extracted_value"):
+        parts = [
+            f"{(r or {}).get('item_code')}: {(r or {}).get(key)}"
+            for r in group if (r or {}).get(key) not in (None, "")
+        ]
+        if parts:
+            base[key] = " | ".join(parts)
+    # Nilai ``match`` per field bisa berbeda; baris gabungan tidak mewakili satu pun
+    # secara khusus, jadi dikosongkan alih-alih memakai punya baris pertama.
+    if len(group) > 1 and "match" in base:
+        base["match"] = ""
+    return base
+
+
+def merge_dynamic_verification_rows(rows: list) -> list:
+    """Baris VERIFIKASI DINAMIS yang berulang dijadikan SATU baris (31 Agustus 2026).
+
+    Permintaan bisnis: pada verifikasi dinamis, B17 dan B16 cukup muncul SEKALI per
+    tiket dengan seluruh alasannya digabung. Tiket ``180107uT48`` misalnya menerbitkan
+    tiga B17 — Alamat Rumah, Alamat Kantor, Alamat Email Terdaftar — yang menyatakan
+    kegagalan YANG SAMA (verifikasi dinamis tidak terbukti) dari tiga sisi.
+
+    **CATATAN, aturan lanjutan hari yang sama:** B17 kemudian dibatasi HANYA untuk
+    field statik (lihat bagian 2 ``build_error_code_table``), sehingga baris B17
+    dinamis tidak lagi pernah terbit dari evaluasi AI dan cabang B17 di sini praktis
+    tidak terpakai. Fungsi ini dipertahankan sebagai penjaga: B16 tetap dilebur bila
+    suatu saat terbit lebih dari satu, dan cabang B17-dinamis siap kembali berguna
+    bila aturan itu diubah lagi. Baris hasil banding "add" TIDAK melewatinya —
+    ketiga pemanggil menjalankannya SEBELUM ``inject_added_rows``, karena baris yang
+    ditulis QC sendiri tidak boleh diam-diam digabung.
+
+    Yang digabung HANYA:
+
+    * **B17 dari 9 field DINAMIS** (``CARD_HOLDER_DYNAMIC_FIELDS``). B17 dari field
+      STATIK (Tanggal Lahir, Nama Ibu Kandung) TIDAK ikut: keduanya kewajiban
+      terpisah yang masing-masing punya item scorecard sendiri (SC_CL_23_1/23_2) dan
+      irisan Critical Compliance sendiri, jadi meleburnya akan menyembunyikan
+      kegagalan yang berbeda di balik satu baris.
+    * **B16**, yang memang satu vonis tentang kecukupan verifikasi dinamis.
+
+    Baris tunggal dibiarkan apa adanya — penggabungan hanya terjadi bila ada dua atau
+    lebih baris sejenis.
+
+    **HANYA UNTUK TAMPILAN.** Dipanggil di permukaan yang MENAMPILKAN tabel Error Code
+    (detail tiket, Agent Error Summary, ekspor XLSX), TIDAK di dalam
+    ``build_error_code_table``. Alasannya: keluaran builder itu juga menjadi bahan
+    ``risk_base_tally``, yang menghitung PELANGGARAN per baris — melebur di sana
+    berarti diam-diam memotong Total Failure dan Failure Rate.
+    """
+    dyn_labels = {titleize_field(f) for f in CARD_HOLDER_DYNAMIC_FIELDS}
+
+    def bucket(r):
+        code = (r or {}).get("error_code")
+        if code == "B16":
+            return "B16"
+        if code == "B17" and (r or {}).get("item_code") in dyn_labels:
+            return "B17_DYN"
+        return None
+
+    groups: dict = {}
+    for r in rows:
+        key = bucket(r)
+        if key:
+            groups.setdefault(key, []).append(r)
+
+    mergeable = {k for k, g in groups.items() if len(g) > 1}
+    if not mergeable:
+        return rows
+
+    out, done = [], set()
+    for r in rows:
+        key = bucket(r)
+        if key not in mergeable:
+            out.append(r)
+            continue
+        if key in done:
+            continue  # sudah diwakili baris gabungan di posisi yang pertama
+        done.add(key)
+        out.append(_merge_verification_rows(groups[key]))
+    return out
+
+
 def build_error_code_table(evaluation: dict) -> list:
     """Build the grouped Error Code table rows from an LLM ``evaluation`` object.
 
@@ -943,20 +1123,69 @@ def build_error_code_table(evaluation: dict) -> list:
             evidence_quote=_evidence_quote(evidence),
         )
 
-    # --- 2) Card Holder Verification: B17 per mismatched/skipped field ---
-    # Once the dynamic 2-match rule is met (>= 2 dynamic fields MATCH) the leftover
-    # MISMATCH dynamic fields carry no penalty, so they are not surfaced as B17 errors.
-    ch_two_match = card_holder_two_match_satisfied(evaluation.get("card_holder_verification"))
+    # --- 1c) Scorecard: B16 diturunkan dari scorecard verifikasi ---------------
+    # B16 = "Verifikasi statik BERHASIL, verifikasi dinamis kurang/tidak sesuai".
+    # Sampai 31 Agustus 2026 baris ini HANYA muncul bila LLM sendiri menuliskannya di
+    # ``error_codes``, dan ia tidak selalu melakukannya: pada korpus 98 tiket ada 2
+    # tiket (030808fLO1, 100537MsNl) yang SC_CL_23_1/23_2-nya SESUAI dan SC_CL_24-nya
+    # BELUM_SESUAI tetapi tidak menerbitkan B16 sama sekali. Sejak B17 dibatasi ke
+    # field statik (lihat bagian 2), tiket seperti itu akan kehilangan SELURUH kode
+    # verifikasinya — karena itu B16 kini diturunkan di kode, sama seperti B10/B12/B18.
+    #
+    # Syaratnya persis definisi katalognya: verifikasi dinamis GAGAL sementara TIDAK
+    # SATU PUN item statik gagal. ``PENDING`` (zona abu-abu, dokumen pendukung masih
+    # ditunggu) dihitung sebagai BELUM gagal — statiknya belum divonis, jadi B17 pun
+    # belum terbit dan B16-lah yang benar.
+    _sc_status = {
+        (it or {}).get("item_code"): ((it or {}).get("status") or "").upper()
+        for it in (evaluation.get("scorecard_result") or [])
+    }
+    _static_failed = any(
+        _sc_status.get(code) == "BELUM_SESUAI"
+        for code in CARD_HOLDER_STATIC_SCORECARD.values()
+    )
+    if (
+        _sc_status.get(CARD_HOLDER_DYNAMIC_SCORECARD) == "BELUM_SESUAI"
+        and not _static_failed
+        and not any((c or {}).get("error_code") == "B16" for c in evaluation.get("error_codes") or [])
+    ):
+        _dyn_item = next(
+            (it for it in (evaluation.get("scorecard_result") or [])
+             if (it or {}).get("item_code") == CARD_HOLDER_DYNAMIC_SCORECARD),
+            {},
+        )
+        _dyn_ev = _dyn_item.get("evidence") or {}
+        add(
+            SOURCE_SCORECARD,
+            "B16",
+            None,
+            not_fulfilled_reason(_dyn_item, evaluation, prefer_item_reason=True),
+            _evidence_text(_dyn_ev),
+            _dyn_ev.get("ticket_id") or "",
+            timestamp=_evidence_timestamp(_dyn_ev),
+            evidence_quote=_evidence_quote(_dyn_ev),
+        )
+
+    # --- 2) Card Holder Verification: B17 per field STATIK yang MISMATCH ------
+    # B17 = "Tidak ada Verifikasi / verifikasi statik kurang / tidak berhasil" —
+    # katalognya menyebut VERIFIKASI STATIK, jadi hanya ``tanggal_lahir`` dan
+    # ``nama_ibu_kandung`` yang boleh menerbitkannya (aturan 31 Agustus 2026).
+    #
+    # Sampai tanggal itu field DINAMIS ikut menerbitkan B17 satu per satu — pada
+    # tiket 180107uT48 tiga sekaligus (Alamat Rumah, Alamat Kantor, Alamat Email)
+    # padahal verifikasi statiknya sama sekali tidak gagal (tanggal lahir MATCH, nama
+    # ibu kandung PENDING). Kegagalan dinamis sudah punya kodenya sendiri, B16, jadi
+    # menerbitkannya sebagai B17 berarti memberi label "verifikasi statik tidak
+    # berhasil" pada tiket yang statiknya justru berhasil — dan menghukumnya dengan
+    # Risk Base H, bukan M.
+    #
+    # SKIPPED_NULL & PENDING tidak menerbitkan apa pun: yang pertama tidak berpenalti,
+    # yang kedua masih menunggu dokumen dalam tenggat H+2. Begitu tenggatnya lewat,
+    # ``apply_static_document_status`` mengubahnya menjadi MISMATCH dan B17 terbit.
     for v in evaluation.get("card_holder_verification") or []:
-        # SKIPPED_NULL fields carry no penalty and are no longer surfaced as errors —
-        # only true MISMATCH rows become B17.
         if (v or {}).get("match") != "MISMATCH":
             continue
-        if (
-            ch_two_match
-            and (v or {}).get("field") in CARD_HOLDER_DYNAMIC_FIELDS
-            and (v or {}).get("match") == "MISMATCH"
-        ):
+        if (v or {}).get("field") not in CARD_HOLDER_STATIC_SCORECARD:
             continue
         # Carry the reference/extracted/match so the QC "Manual Check" (banding)
         # modal can prefill them and snapshot the full AI row.
@@ -1089,6 +1318,11 @@ def build_error_code_table(evaluation: dict) -> list:
         group_order.setdefault(r["sumber"], len(group_order))
     rows.sort(key=lambda r: (group_order[r["sumber"]], error_code_sort_key(r["error_code"])))
 
+    # Penggabungan B16 / B17-dinamis SENGAJA TIDAK dilakukan di sini — lihat
+    # ``merge_dynamic_verification_rows``. Fungsi ini adalah sumber baris untuk
+    # PENGHITUNGAN (risk base per pelanggaran di ``risk_base_tally``), bukan hanya
+    # untuk tampilan; meleburnya di sini akan diam-diam mengecilkan Total Failure —
+    # pada korpus 98 tiket, dari 114 menjadi 104.
     return rows
 
 
@@ -1473,6 +1707,38 @@ CASHLINE_FIELD_PENALTY = {
 CARD_HOLDER_STATIC_PENALTY = {
     "tanggal_lahir": 0, "nama_ibu_kandung": 0,
 }
+# CASHLINE field -> item scorecard yang dijatuhkan BELUM_SESUAI saat MISMATCH
+# (aturan 31 Agustus 2026). Sebelumnya MISMATCH cashline memotong skor lewat jalurnya
+# sendiri (``item_score`` per field -> ``ai_score_verification``) sementara item
+# scorecard-nya tetap SESUAI — dua jalur potongan paralel untuk satu kegagalan.
+#
+# Model yang benar: scorecard menilai BUKAN HANYA apakah agent menanyakan/menjelaskan
+# sesuatu, tetapi juga KEBENARAN datanya. Alurnya scorecard -> error code -> error code
+# menjatuhkan item scorecard yang berasosiasi; TIDAK ADA potongan dari error code itu
+# sendiri (lihat ``_propagate_cashline_to_scorecard``).
+#
+# Pemetaannya bukan tebakan: penalti per-field lama (``CASHLINE_FIELD_PENALTY``) SAMA
+# PERSIS dengan bobot item di kolom kanan pada 9 dari 10 field — bukti bahwa tabel
+# penalti itu memang diturunkan dari bobot item ini sejak awal. Yang dipilih adalah
+# keluarga "menjelaskan/menanyakan" (SC_CL_6..15), tempat datanya PERTAMA KALI
+# ditegakkan di panggilan; item "konfirmasi" (SC_CL_25..32) menilai kewajiban lain,
+# yaitu ada-tidaknya recap penutup, dan dinilai sendiri.
+#
+# ``nama_pemilik_rekening`` satu-satunya yang belum punya penalti lama — hari ini ia
+# menerbitkan B02 TANPA potongan sama sekali. Dipasangkan ke SC_CL_13, bobot 2.
+CASHLINE_FIELD_SCORECARD = {
+    "nominal_pencairan": "SC_CL_10",              # bobot 1
+    "tenor_dalam_bulan": "SC_CL_6",               # bobot 1
+    "nominal_cicilan_per_bulan": "SC_CL_9",       # bobot 1
+    "bunga": "SC_CL_7",                           # bobot 1
+    "nama_bank": "SC_CL_12",                      # bobot 2
+    "penalti_pelunasan_dipercepat": "SC_CL_15",   # bobot 2
+    "nomor_rekening": "SC_CL_14",                 # bobot 2
+    "nama_pemilik_rekening": "SC_CL_13",          # bobot 2
+    "provisi": "SC_CL_8",                         # bobot 4
+    "biaya_admin": "SC_CL_11",                    # bobot 5
+}
+
 # Card Holder STATIC field -> the scorecard item it forces to BELUM_SESUAI on MISMATCH
 # (VERIFICATION -> SCORECARD PROPAGATION in the campaign prompt). SC_CL_23_1 = tanggal
 # lahir, SC_CL_23_2 = nama ibu kandung. The dynamic group maps to SC_CL_24 (2-match rule).
@@ -1583,6 +1849,136 @@ def _propagate_verification_to_scorecard(evaluation: dict) -> dict:
     return {**evaluation, "scorecard_result": new_items} if changed else evaluation
 
 
+def _cashline_pending_applies(item, row) -> bool:
+    """Bolehkah item scorecard ``item`` ditangguhkan menjadi PENDING oleh baris cashline
+    ``row``?
+
+    * item yang sudah PENDING -> tidak ada yang perlu diubah;
+    * item SESUAI -> selalu boleh (jalur lama);
+    * item BELUM_SESUAI -> hanya bila transkrip memang memuat nilainya
+      (``extracted_value`` terisi). Lihat ``_propagate_cashline_to_scorecard``.
+    """
+    status = (item or {}).get("status")
+    if status == "PENDING":
+        return False
+    if status != "BELUM_SESUAI":
+        return True
+    return bool(str((row or {}).get("extracted_value") or "").strip())
+
+
+def _propagate_cashline_to_scorecard(evaluation: dict) -> dict:
+    """MISMATCH ``cashline_data_verification`` menjatuhkan item scorecard pasangannya.
+
+    Aturan 31 Agustus 2026. Cerminan dari VERIFICATION -> SCORECARD PROPAGATION yang
+    sudah lama berlaku untuk card holder, kini dipasang juga untuk cashline:
+
+        scorecard dibuat -> error code -> error code menjatuhkan item scorecard
+
+    Konsekuensi pentingnya, dan alasan fungsi ini ada: **error code tidak lagi
+    memotong skor sendiri.** Satu-satunya sumber potongan adalah item scorecard yang
+    BELUM_SESUAI. Karena itu ``ai_score_verification`` ikut dinolkan di sini — kalau
+    tidak, satu kegagalan yang sama akan dipotong DUA KALI (sekali lewat penalti
+    per-field, sekali lewat bobot item scorecard). Sisi card holder sudah dinolkan
+    sejak v33 dengan alasan yang persis sama; cashline adalah penyumbang terakhir yang
+    tersisa di sana.
+
+    Contoh ``010714jUKH``: ``nomor_rekening`` di TMS 4820008469 sedangkan transkrip
+    4823008469 (digit ke-4 salah input). Sebelum aturan ini SC_CL_14 tetap SESUAI dan
+    potongannya -2 datang dari ``ai_score_verification``. Sekarang SC_CL_14 menjadi
+    BELUM_SESUAI dan -2 itu datang dari bobot itemnya sendiri.
+
+    Hanya ``MISMATCH`` yang menjatuhkan; ``SKIPPED_NULL`` tidak berpenalti. Satu field
+    punya zona penangguhan ``PENDING`` — ``nama_pemilik_rekening``, yang menunggu cover
+    buku tabungan selama tenggat H+2 (lihat ``apply_cashline_document_status``): item
+    pasangannya ikut PENDING, tidak memotong skor dan tidak memveto AI Status.
+
+    PENANGGUHAN JUGA MENGANGKAT ITEM YANG SUDAH BELUM_SESUAI (31 Agustus 2026). Prompt
+    menyuruh LLM menuliskan sendiri propagasi MISMATCH -> BELUM_SESUAI, sementara ia
+    DILARANG menerbitkan PENDING (keadaan dokumen & tenggat H+2 hanya diketahui sistem).
+    Akibatnya SC_CL_13 sudah tertulis BELUM_SESUAI sebelum fungsi ini berjalan, dan
+    penjaga lama — yang hanya mengizinkan SESUAI -> PENDING — melewatinya: barisnya
+    berbunyi PENDING tetapi item scorecard-nya tetap BELUM_SESUAI, memveto tiket menjadi
+    Not Qualified plus iris 10% ``non_tolerable_bomb`` justru selama masa tunggu dokumen.
+    Pada korpus 98 tiket ada 10 tiket dalam keadaan itu, seluruhnya SC_CL_13 (mis.
+    ``060228OEvG``: 89% "Vonny Salomi Amnifu" vs TMS "VONI SALOMI AMNIFU", 148 -> 133 dan
+    PASS -> FAIL). ``item_score`` dikembalikan ke bobot penuh agar tabel Scorecard tidak
+    menampilkan 0 untuk item yang tidak dipotong.
+
+    SYARATNYA transkrip memang MEMUAT nilainya (``extracted_value`` terisi). Bila kosong
+    — agent tidak pernah menyebutkan nama pemilik rekening (mis. ``111030VH2c``) — item
+    itu gagal karena kewajiban "menyebutkan/menanyakan"-nya sendiri, bukan karena beda
+    ejaan, dan cover buku tabungan tidak bisa membuktikan sesuatu yang tidak pernah
+    diucapkan. Item semacam itu TETAP BELUM_SESUAI.
+
+    Non-destruktif. Dipanggil berdampingan dengan
+    ``_propagate_verification_to_scorecard``.
+    """
+    if not evaluation:
+        return evaluation
+    rows = evaluation.get("cashline_data_verification") or []
+    if not rows:
+        return evaluation
+    force, pending = {}, {}
+    for v in rows:
+        field = (v or {}).get("field")
+        code = CASHLINE_FIELD_SCORECARD.get(field)
+        if not code:
+            continue
+        state = (v or {}).get("match")
+        if state == "MISMATCH":
+            force.setdefault(code, v)
+        elif state == "PENDING":
+            pending.setdefault(code, v)
+    # BELUM_SESUAI menang bila keduanya menunjuk item yang sama — kegagalan yang sudah
+    # pasti mengalahkan penangguhan (sama seperti sisi statik).
+    pending = {c: v for c, v in pending.items() if c not in force}
+    result = evaluation
+    if force or pending:
+        new_items = []
+        changed = False
+        for it in evaluation.get("scorecard_result") or []:
+            code = (it or {}).get("item_code")
+            if code in force and (it or {}).get("status") != "BELUM_SESUAI":
+                v = force[code]
+                updated = {**it, "status": "BELUM_SESUAI", "item_score": 0}
+                reason = str((v or {}).get("reason") or "").strip()
+                if reason:
+                    updated["reason"] = reason
+                new_items.append(updated)
+                changed = True
+            elif code in pending and _cashline_pending_applies(it, pending[code]):
+                # PENDING tidak memotong skor dan tidak memveto AI Status. Untuk item
+                # yang datang dari SESUAI, ``item_score`` dibiarkan apa adanya; untuk
+                # yang DIANGKAT dari BELUM_SESUAI, ia dikembalikan ke bobot penuh —
+                # nilainya sudah dinolkan LLM padahal penangguhan tidak memotong.
+                v = pending[code]
+                updated = {**it, "status": "PENDING"}
+                if (it or {}).get("status") == "BELUM_SESUAI":
+                    weight = (it or {}).get("weight")
+                    if isinstance(weight, (int, float)) and not isinstance(weight, bool):
+                        updated["item_score"] = weight
+                reason = str((v or {}).get("reason") or "").strip()
+                if reason:
+                    updated["reason"] = reason
+                new_items.append(updated)
+                changed = True
+            else:
+                new_items.append(it)
+        if changed:
+            result = {**evaluation, "scorecard_result": new_items}
+
+    # Potongan per-field DILEPAS seluruhnya, terlepas dari ada tidaknya MISMATCH yang
+    # dijatuhkan di atas: begitu potongannya pindah ke scorecard, membiarkan angka lama
+    # tetap hidup di ``ai_score_verification`` berarti menghitungnya dua kali.
+    try:
+        already_zero = float(result.get("ai_score_verification")) == 0
+    except (TypeError, ValueError):
+        already_zero = result.get("ai_score_verification") is None
+    if not already_zero:
+        result = {**result, "ai_score_verification": 0}
+    return result
+
+
 def card_holder_two_match_satisfied(items) -> bool:
     """HYBRID KB_CL_24 min_verification_required=2 gate over the 9 dynamic card-holder
     fields (VD_1..VD_9). A param counts as VERIFIED when EITHER its value matches the
@@ -1628,13 +2024,23 @@ def _apply_verification_appeals(
     if not evaluation or not approved_appeals:
         return evaluation
     # titleized field (item_code) -> latest approved appeal for it (this source only)
+    #
+    # ``item_code`` bisa berisi BEBERAPA field yang digabung (lihat
+    # ``merge_dynamic_verification_rows``: "Alamat Rumah, Alamat Kantor, ..."). Satu
+    # banding atas baris gabungan itu harus mengenai SEMUA field yang diwakilinya —
+    # kalau tidak, banding yang disetujui tidak mengubah apa pun karena tak satu pun
+    # nama field cocok dengan teks gabungannya.
     by_field = {}
     for a in approved_appeals:
         if not code_match((_appeal_attr(a, "error_code") or "").strip().upper()):
             continue
         item_code = _appeal_attr(a, "item_code")
-        if item_code:
-            by_field[item_code] = a
+        if not item_code:
+            continue
+        for part in str(item_code).split(MERGED_ITEM_SEP):
+            part = part.strip()
+            if part:
+                by_field[part] = a
     if not by_field:
         return evaluation
 
@@ -1784,9 +2190,13 @@ def _card_holder_static_restore_codes(approved_appeals: list) -> set:
     for a in approved_appeals or []:
         if (_appeal_attr(a, "error_code") or "").strip().upper() != "B17":
             continue
-        code = labels.get((_appeal_attr(a, "item_code") or "").strip())
-        if code:
-            out.add(code)
+        # ``item_code`` bisa berisi beberapa label yang digabung (baris B17 dinamis
+        # yang dilebur); dipecah supaya pencocokannya tetap per field. Baris STATIK
+        # sendiri tidak pernah dilebur, jadi di praktiknya ini hanya satu bagian.
+        for part in str(_appeal_attr(a, "item_code") or "").split(MERGED_ITEM_SEP):
+            code = labels.get(part.strip())
+            if code:
+                out.add(code)
     return out
 
 
@@ -1794,9 +2204,13 @@ def _has_dynamic_card_holder_appeal(approved_appeals: list) -> bool:
     """True when an approved B17 banding targets one of the 9 DYNAMIC card-holder
     fields (item_code == titleized dynamic field). Used to gate the SC_CL_24 restore."""
     labels = {titleize_field(f) for f in CARD_HOLDER_DYNAMIC_FIELDS}
+    # Baris B17 dinamis yang dilebur membawa BEBERAPA label sekaligus, jadi
+    # pencocokan harus per bagian — kalau tidak, banding atas baris gabungan tidak
+    # pernah membuka gerbang pemulihan SC_CL_24.
     return any(
         (_appeal_attr(a, "error_code") or "").strip().upper() == "B17"
-        and (_appeal_attr(a, "item_code") or "").strip() in labels
+        and any(part.strip() in labels
+                for part in str(_appeal_attr(a, "item_code") or "").split(MERGED_ITEM_SEP))
         for a in approved_appeals or []
     )
 
@@ -2165,6 +2579,111 @@ def normalize_static_verification(evaluation: dict) -> dict:
     return _restore_critical_items(result, restore)
 
 
+def _dynamic_side_missing(v: dict) -> bool:
+    """Apakah salah satu SISI pembanding baris verifikasi dinamis ini kosong.
+
+    Dua sisinya: ``reference_value`` (isian Ascend) dan ``extracted_value`` (nilai
+    yang berhasil ditarik dari transkrip). Kosong = None atau string yang hanya
+    berisi spasi. ``extracted_mentions`` SENGAJA tidak ikut menyelamatkan baris:
+    ucapan seperti "Masih sama." atau "Nggak ada sih Mbak." memang terekam sebagai
+    penyebutan, tetapi tidak menghasilkan nilai yang bisa diadu ke Ascend — dan
+    justru barisnya itulah yang selama ini menjadi B17 tanpa dasar pembanding.
+    """
+    ref = str((v or {}).get("reference_value") or "").strip()
+    ext = str((v or {}).get("extracted_value") or "").strip()
+    return not ref or not ext
+
+
+def _dynamic_skipped_reason(v: dict) -> str:
+    """Kalimat pengganti untuk baris dinamis yang diturunkan menjadi SKIPPED_NULL.
+
+    Ditulis dari sisi MANA yang kosong, karena kalimat asli LLM menjelaskan vonis
+    LAMA ("...sehingga isian Ascend tidak terverifikasi") dan akan berbunyi seperti
+    kesalahan agent di sebelah kolom Match yang sudah berbunyi SKIPPED_NULL.
+    """
+    ref = str((v or {}).get("reference_value") or "").strip()
+    ext = str((v or {}).get("extracted_value") or "").strip()
+    label = titleize_field((v or {}).get("field"))
+    if not ref and not ext:
+        return f"{label} tidak ada acuan pada Ascend maupun transkrip, tidak dinilai."
+    if not ref:
+        return f"{label} tidak ada acuannya pada Ascend, tidak ada yang bisa dibandingkan."
+    return (
+        f"{label} tidak menghasilkan nilai dari transkrip, tidak ada yang bisa "
+        f"dibandingkan dengan isian Ascend."
+    )
+
+
+def normalize_dynamic_verification(evaluation: dict) -> dict:
+    """Baris verifikasi DINAMIS yang salah satu sisinya kosong menjadi ``SKIPPED_NULL``.
+
+    Aturan (31 Agustus 2026, atas permintaan Bank Mega): untuk 9 field dinamis
+    ``CARD_HOLDER_DYNAMIC_FIELDS``, bila **isian Ascend ATAU nilai dari transkrip
+    kosong** maka barisnya BUKAN MISMATCH melainkan ``SKIPPED_NULL`` — tidak ada
+    dua sisi untuk dibandingkan, jadi tidak ada dasar untuk menyalahkan agent.
+
+    Sebelumnya LLM hanya menulis ``SKIPPED_NULL`` ketika KEDUA sisi kosong; satu
+    sisi kosong (paling sering ``no_telpon_kantor`` dan ``nama_keluarga_relasi``:
+    ada di Ascend, tidak pernah disebut di panggilan) menjadi MISMATCH dan
+    menerbitkan B17. Pada korpus 98 hasil saat aturan ini dibuat, 146 baris di 86
+    tiket berada dalam keadaan itu.
+
+    Yang IKUT berubah: baris tersebut hilang dari tabel Error Code (``build_error_code_table``
+    hanya menerbitkan B17 untuk ``match == "MISMATCH"``), dari Agent Error Summary,
+    dan dari rincian pengurangan di XLSX.
+
+    Yang TIDAK berubah — dan memang tidak boleh:
+
+    * **Skor.** Field dinamis tidak lagi memotong ``ai_score_verification`` sejak v33
+      (``_card_holder_address_group_score`` selalu 0.0), dan aturan 2-match KB_CL_24
+      menghitung yang TERVERIFIKASI (``MATCH`` atau ``event_verified``) — SKIPPED_NULL
+      tidak pernah termasuk, dulu maupun sekarang. Jadi SC_CL_24 dan ``ai_score_phase_2``
+      persis sama; yang hilang hanya baris error tanpa dasar pembanding.
+    * **``event_verified``** dibiarkan apa adanya, sehingga param tanpa acuan Ascend
+      yang benar-benar ditanya+dijawab tetap dihitung oleh ``card_holder_two_match_satisfied``.
+    * **Field STATIK** (``tanggal_lahir``, ``nama_ibu_kandung``) tidak disentuh sama
+      sekali: keduanya wajib ditanyakan, jadi transkrip yang kosong di situ justru
+      kegagalan verifikasi yang sesungguhnya. Lihat ``normalize_static_verification``.
+
+    ``similarity_percent`` dinolkan menjadi None dan ``item_score`` menjadi 0 supaya
+    barisnya sebangun dengan SKIPPED_NULL terbitan LLM (dan tidak ikut terdaftar di
+    rincian pengurangan XLSX, yang menyaring ``item_score < 0``).
+
+    Dipanggil berdampingan dengan ``normalize_static_verification``, SEBELUM banding
+    & skor dihitung. Non-destruktif: mengembalikan evaluasi baru hanya bila ada yang
+    berubah.
+    """
+    if not evaluation:
+        return evaluation
+    items = evaluation.get("card_holder_verification")
+    if not isinstance(items, list) or not items:
+        return evaluation
+
+    new_items = []
+    changed = False
+    for it in items:
+        v = it or {}
+        if (
+            v.get("field") not in CARD_HOLDER_DYNAMIC_FIELDS
+            or v.get("match") == "SKIPPED_NULL"
+            or not _dynamic_side_missing(v)
+        ):
+            new_items.append(it)
+            continue
+        new_items.append({
+            **v,
+            "match": "SKIPPED_NULL",
+            "similarity_percent": None,
+            "item_score": 0,
+            "reason": _dynamic_skipped_reason(v),
+        })
+        changed = True
+
+    if not changed:
+        return evaluation
+    return {**evaluation, "card_holder_verification": new_items}
+
+
 def apply_static_document_status(evaluation: dict, uploaded_types=(), sla_expired: bool = False) -> dict:
     """Terapkan status dokumen pada baris verifikasi STATIK yang berada di ZONA ABU-ABU.
 
@@ -2241,6 +2760,68 @@ def apply_static_document_status(evaluation: dict, uploaded_types=(), sla_expire
         })
         changed = True
     return {**evaluation, "card_holder_verification": out} if changed else evaluation
+
+
+def apply_cashline_document_status(evaluation: dict, uploaded_types=(), sla_expired: bool = False) -> dict:
+    """Tangguhkan baris CASHLINE yang meminta dokumen pendukung selama tenggat H+2.
+
+    Cerminan ``apply_static_document_status`` untuk sisi cashline. Satu-satunya field
+    yang meminta dokumen adalah ``nama_pemilik_rekening`` (cover buku tabungan) —
+    lihat ``compliance.documents._CASHLINE_DOC_FIELDS``.
+
+    Tanpa penangguhan ini, aturan 31 Agustus 2026 (MISMATCH cashline menjatuhkan item
+    scorecard) akan MEMOTONG JALUR DOKUMEN: bank meminta cover buku tabungan justru
+    untuk membuktikan nama pemiliknya, tetapi tiketnya sudah Not Qualified sebelum
+    dokumen itu datang. Pada korpus 98 tiket ada 15 tiket dalam keadaan itu, seluruhnya
+    menunggu dokumen untuk ``nama_pemilik_rekening``.
+
+    Tiga keadaan, sama persis dengan sisi statik:
+
+    * dokumen yang diminta SUDAH diunggah -> baris dikembalikan ke ``MATCH``,
+      kewajibannya selesai;
+    * belum diunggah dan tenggat H+2 BELUM lewat -> ``PENDING`` (tidak memotong skor,
+      tidak memveto status);
+    * belum diunggah dan tenggat SUDAH lewat -> tetap ``MISMATCH``, dan propagasi
+      menjatuhkan item scorecard-nya seperti biasa.
+
+    Non-destruktif. Dipanggil SESUDAH ``apply_static_document_status`` dan SEBELUM
+    ``_propagate_cashline_to_scorecard``.
+    """
+    if not evaluation:
+        return evaluation
+    items = evaluation.get("cashline_data_verification")
+    if not isinstance(items, list) or not items:
+        return evaluation
+    from compliance.documents import DOCUMENT_TYPES, _CASHLINE_DOC_FIELDS
+
+    have = {str(t).strip() for t in (uploaded_types or ()) if str(t or "").strip()}
+    out, changed = [], False
+    for it in items:
+        v = it if isinstance(it, dict) else {}
+        rule = _CASHLINE_DOC_FIELDS.get(v.get("field"))
+        if rule is None or v.get("match") != "MISMATCH":
+            out.append(it)
+            continue
+        if rule["doc_type"] in have:
+            out.append({**v, "match": "MATCH"})
+            changed = True
+            continue
+        if sla_expired:
+            out.append(it)          # tenggat lewat -> tetap MISMATCH
+            continue
+        label = DOCUMENT_TYPES.get(rule["doc_type"], {}).get(
+            "label", str(rule["doc_type"]).upper())
+        base = str(v.get("reason") or "").strip()
+        base = base[:-1] if base.endswith(".") else base
+        out.append({
+            **v,
+            "match": "PENDING",
+            "reason": (f"{base}; menunggu dokumen {label} sampai tenggat H+2."
+                       if base else
+                       f"Menunggu dokumen {label} sampai tenggat H+2."),
+        })
+        changed = True
+    return {**evaluation, "cashline_data_verification": out} if changed else evaluation
 
 
 def apply_approved_card_holder_appeals(evaluation: dict, approved_appeals: list) -> dict:
@@ -2476,6 +3057,11 @@ def apply_added_score_appeals(evaluation: dict, added_appeals: list) -> dict:
     # evaluasi LLM, dari hitung ulang Python, atau dari banding 'add') menurunkan
     # SC_CL_23_1/23_2, dan item kritis yang baru turun itu harus ikut FAIL.
     evaluation = _propagate_verification_to_scorecard(evaluation)
+    # Cashline menyusul dengan aturan yang sama: MISMATCH menjatuhkan item scorecard
+    # pasangannya, dan potongan per-field-nya dilepas supaya tidak dihitung dua kali.
+    # HARUS sebelum applier kritis, sama seperti baris di atas — item kritis yang baru
+    # turun karenanya (mis. SC_CL_37 lewat banding) ikut FAIL.
+    evaluation = _propagate_cashline_to_scorecard(evaluation)
     evaluation = _sync_critical_compliance(evaluation, added_appeals)
     return evaluation
 
@@ -2499,7 +3085,17 @@ def apply_added_card_holder_appeals(evaluation: dict, added_appeals: list) -> di
     )
 
 
-CRITICAL_ITEM_CODES = ("SC_CL_4", "SC_CL_23_1", "SC_CL_23_2", "SC_CL_37")
+# Item scorecard yang kegagalannya memicu SCORE BOMB: satu iris penuh
+# ``-(maximum_score / 4)`` pada ``ai_score_critical_compliance_check``.
+#
+# ``SC_CL_24`` (verifikasi dinamis minimal 2 data) DITAMBAHKAN 31 Agustus 2026 atas
+# permintaan bisnis. Sebelumnya hanya verifikasi STATIK yang mengebom skor
+# (SC_CL_23_1/23_2), sementara kegagalan verifikasi DINAMIS cuma memotong bobot
+# itemnya sendiri — 15 dari 150. Akibatnya tiket yang verifikasi dinamisnya gagal
+# total masih berskor 135/150, terbaca "nyaris sempurna" padahal bank menganggapnya
+# kegagalan verifikasi. Vonisnya sendiri memang sudah Not Qualified lewat veto
+# non-tolerable, jadi yang diperbaiki aturan ini adalah ANGKANYA, bukan statusnya.
+CRITICAL_ITEM_CODES = ("SC_CL_4", "SC_CL_23_1", "SC_CL_23_2", "SC_CL_37", "SC_CL_24")
 
 
 def _sync_critical_compliance(evaluation: dict, added_appeals: list) -> dict:
@@ -2555,6 +3151,30 @@ def _sync_critical_compliance(evaluation: dict, added_appeals: list) -> dict:
             flipped += 1
         else:
             new_items.append(it)
+
+    # Item kritis yang BELUM PUNYA entri di ``checked_items`` ditambahkan di sini.
+    # Perlu karena ``SC_CL_24`` baru menjadi item kritis pada 31 Agustus 2026: seluruh
+    # hasil evaluasi yang sudah ada — dan hasil dari prompt yang belum diperbarui —
+    # hanya memuat empat entri lama, sehingga tanpa penambahan ini score bomb-nya tidak
+    # akan pernah menyala untuk tiket mana pun. Requirement-nya disalin dari item
+    # scorecard yang bersangkutan supaya panel Critical Compliance menyebut kewajiban
+    # yang sama dengan scorecard, bukan teks buatan sendiri.
+    present = {(it or {}).get("item_code") for it in items}
+    for code in CRITICAL_ITEM_CODES:
+        if code in present or code not in (added_codes | belum_critical):
+            continue
+        src = next(
+            (it for it in (evaluation.get("scorecard_result") or [])
+             if (it or {}).get("item_code") == code),
+            {},
+        )
+        new_items.append({
+            "item_code": code,
+            "status": "FAIL",
+            "requirement": src.get("requirement") or code,
+        })
+        flipped += 1
+
     if flipped == 0:
         return evaluation
 

@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -282,6 +283,9 @@ def list_results(
     if customer_ids is not None and len(customer_ids) == 0:
         return [], 0
     q = db.query(Result)
+    # Tiket yang disembunyikan tidak boleh muncul di menu ini — lihat
+    # ``hidden_ticket_filter``.
+    q = hidden_ticket_filter(q)
     if uploaded_by_username is not None:
         q = q.filter(
             func.lower(func.trim(Result.uploaded_by_username))
@@ -397,6 +401,9 @@ def list_transcripts(
     effective_status = "done" if ai_filter in ("PASS", "FAIL") else status
 
     q = db.query(Result)
+    # Tiket yang disembunyikan tidak boleh muncul di menu ini — lihat
+    # ``hidden_ticket_filter``.
+    q = hidden_ticket_filter(q)
     if customer_ids is not None:
         # customer_id = prefix sebelum "_" pada source file pertama (sama dengan
         # list_results, jadi kedua menu menyaring dengan aturan yang sama).
@@ -423,16 +430,16 @@ def list_transcripts(
     if ai_filter in ("PASS", "FAIL"):
         # Compute each result's AI Status with the same canonical helper the Results
         # table uses, then keep only the matching Approve/Reject subset.
-        from compliance.stats_aggregate import _result_ai_status
+        #
+        # ``ai_status_map`` (bukan ``_result_ai_status`` langsung): ia menyusun SELURUH
+        # bahannya — kekurangan dokumen, tenggat H+2, STATUS DOKUMEN, kekurangan data
+        # acuan. Tanpa itu setiap tiket yang sedang menunggu dokumen terbaca FAIL di
+        # sini, sehingga menu Transcripts memasukkannya ke filter "Reject" padahal di
+        # daftar Results tiket itu PENDING.
+        from compliance.stats_aggregate import ai_status_map
 
-        rids = [str(r.id) for r in results]
-        appeals = error_code_appeals_for_results(db, rids)
-        qc_reqs = qc_status_requests_for(db, rids)
-        rjson = result_json_map(db, rids)
-        results = [
-            r for r in results
-            if _result_ai_status(rjson.get(str(r.id)), appeals.get(str(r.id)), qc_reqs.get(str(r.id))) == ai_filter
-        ]
+        ai_map = ai_status_map(db, results)
+        results = [r for r in results if ai_map.get(str(r.id)) == ai_filter]
 
     rows = []
     for r in results:
@@ -476,6 +483,9 @@ def list_results_by_date_range(
         func.timezone("Asia/Jakarta", func.timezone("UTC", Result.uploaded_at))
     )
     q = db.query(Result)
+    # Tiket yang disembunyikan tidak boleh muncul di menu ini — lihat
+    # ``hidden_ticket_filter``.
+    q = hidden_ticket_filter(q)
     if status:
         q = q.filter(Result.status == status)
     q = q.filter(wib_date >= start_date)
@@ -507,6 +517,10 @@ def get_stats(
     prefix = func.split_part(Result.source_files[0].astext, "_", 1)
 
     def _scoped(q):
+        # Tiket tersembunyi tidak ikut KPI mana pun (total upload/pending/done/failed
+        # dan rata-rata waktu proses) — kalau tidak, kartu KPI akan menghitungnya
+        # sementara tabel di bawahnya tidak.
+        q = hidden_ticket_filter(q)
         return q.filter(prefix.in_(customer_ids)) if customer_ids is not None else q
 
     counts = (
@@ -549,6 +563,16 @@ def get_daily_stats(db: Session, customer_ids: Optional[list[str]] = None) -> li
         if customer_ids is not None else ""
     )
     params = {"cids": list(customer_ids)} if customer_ids is not None else {}
+    # Tiket tersembunyi dikeluarkan juga di sini. Fungsi ini SQL mentah, jadi
+    # ``hidden_ticket_filter`` (yang bekerja pada query SQLAlchemy) tidak bisa dipakai —
+    # predikatnya ditulis ulang dengan ekspresi ticket id yang sama persis.
+    from compliance.stats_aggregate import hidden_ticket_ids
+
+    hidden = [h.lower() for h in hidden_ticket_ids()]
+    hidden_sql = ""
+    if hidden:
+        hidden_sql = " AND lower(split_part(source_files->>0, '_', 1)) <> ALL(:hidden)"
+        params["hidden"] = hidden
     rows = db.execute(
         text(f"""
             SELECT
@@ -559,7 +583,7 @@ def get_daily_stats(db: Session, customer_ids: Optional[list[str]] = None) -> li
                 SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
             FROM results
-            WHERE uploaded_at >= NOW() - INTERVAL '30 days'{scope_sql}
+            WHERE uploaded_at >= NOW() - INTERVAL '30 days'{scope_sql}{hidden_sql}
             GROUP BY ((uploaded_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Jakarta')::date
             ORDER BY day DESC
         """),
@@ -803,11 +827,31 @@ def _stats_signature(db: Session) -> str:
     #      pindah dari Submissions ke tiket Not Qualified dan hasilnya kelipatan
     #      (4.5x), bukan persen — lihat ``_avg_of``. Nilainya berubah tanpa ada data
     #      baru, jadi snapshot lama HARUS gugur.
-    version = "v20"
+    # v21: daftar tiket yang disembunyikan ikut menentukan isi snapshot. Nomornya
+    #      LOMPAT ke v21 karena perubahan ini datang dari branch main yang juga
+    #      menamainya "v19" — dua arti untuk satu nomor berarti salah satu kelompok
+    #      cache tidak akan gugur. Menaikkan nomor jauh lebih murah daripada
+    #      menyajikan angka basi tanpa gejala.
+    # v22: kolom "Submissions" pohon Hierarki kini berarti jumlah TRANSKRIP yang
+    #      dinilai (2 September 2026, dari main) — panggilan milik agent lain pada
+    #      tiket dua-agent tidak ikut. Jumlah tiketnya pindah ke ``ticket_count``.
+    #      Isi snapshot berubah tanpa ada data baru.
+    # v23: penyebut Avg Failure Rate dikembalikan ke Total Recording (2 September
+    #      2026 sore). Kolom "Submissions" pohon Hierarki berganti nama menjadi
+    #      "Total Recording", dan rasionya kini sepasang dengan kolom itu:
+    #      Total Failure / Total Recording, tetap ditulis sebagai kelipatan.
+    #      Nilainya berubah (5.5x -> 2.8x) tanpa ada data baru, jadi snapshot lama
+    #      HARUS gugur.
+    version = "v23"
     sla = "1" if get_doc_sla_enabled(db) else "0"
+    # Sidik jari daftar tersembunyi. WAJIB ikut: tanpa ini snapshot yang sudah
+    # ter-cache akan terus menyajikan angka tiket yang baru disembunyikan sampai ada
+    # perubahan data lain yang kebetulan menggeser tanda tangannya.
+    hidden = ",".join(sorted(h.lower() for h in get_hidden_ticket_ids(db)))
+    hidden_key = f"{len(hidden.split(',')) if hidden else 0}:{hashlib.md5(hidden.encode()).hexdigest()[:8]}"
     return (
         f"{version}|{res_count}|{res_up}|{res_done}|{rd_count}|{rd_max}"
-        f"|{ap_count}|{ap_rev}|{sales_key}|sla{sla}"
+        f"|{ap_count}|{ap_rev}|{sales_key}|sla{sla}|hid{hidden_key}"
     )
 
 
@@ -2587,6 +2631,59 @@ def set_app_setting(db: Session, key: str, value: str, username: str = None) -> 
     _APP_SETTING_CACHE.pop(key, None)
     _APP_SETTING_CACHE_AT.pop(key, None)
     return value
+
+
+HIDDEN_TICKETS_SETTING_KEY = "hidden_ticket_ids"
+
+
+def get_hidden_ticket_ids(db: Session) -> tuple:
+    """Ticket id yang DISEMBUNYIKAN dari seluruh permukaan pembacaan.
+
+    Dipakai untuk menyiapkan tampilan presentasi (permintaan bisnis 31 Agustus 2026):
+    tiket yang data acuannya kosong (Ascend/TMS/agent) dan tiket ber-Failure Rate di
+    atas 100% ditahan agar tidak muncul di menu Statistik, Results, dan Transcripts.
+
+    Disimpan sebagai DAFTAR TETAP (dipisah koma) di ``app_settings``, bukan aturan yang
+    dihitung ulang tiap saat. Dua alasannya:
+
+    * kriteria ">100%" bersifat MELINGKAR — rasionya dihitung oleh Statistik, sementara
+      Statistik itu sendiri yang sedang disaring;
+    * isinya harus tetap sama sepanjang presentasi, apa pun yang terjadi pada data.
+
+    Mengosongkan nilainya mematikan penyembunyian seluruhnya. Perbandingannya
+    case-insensitive dan spasinya dibuang, supaya salin-tempel dari spreadsheet tidak
+    diam-diam meleset.
+    """
+    raw = get_app_setting(db, HIDDEN_TICKETS_SETTING_KEY, "")
+    return tuple(
+        part.strip() for part in str(raw or "").replace("\n", ",").split(",") if part.strip()
+    )
+
+
+def set_hidden_ticket_ids(db: Session, ticket_ids, username: str = None) -> tuple:
+    """Simpan daftar ticket id yang disembunyikan. List kosong = tidak ada yang ditahan."""
+    clean = [str(t).strip() for t in (ticket_ids or []) if str(t or "").strip()]
+    set_app_setting(db, HIDDEN_TICKETS_SETTING_KEY, ",".join(clean), username)
+    return tuple(clean)
+
+
+def hidden_ticket_filter(query):
+    """Sisipkan penyaring "bukan tiket tersembunyi" ke sebuah query ``Result``.
+
+    Ticket id diturunkan dari nama berkas pertama (``<ticket>_<timestamp>.pdf``) —
+    ekspresi yang SAMA dengan yang dipakai penyaring cakupan dan penghapusan tiket,
+    jadi tidak ada definisi "ticket id" kedua yang bisa melenceng.
+
+    Pemanggil menyuntikkan daftarnya lewat ``compliance.stats_aggregate.hidden_ticket_ids()``
+    supaya tidak perlu sesi DB di jalur panas.
+    """
+    from compliance.stats_aggregate import hidden_ticket_ids
+
+    hidden = hidden_ticket_ids()
+    if not hidden:
+        return query
+    prefix = func.lower(func.split_part(Result.source_files[0].astext, "_", 1))
+    return query.filter(~prefix.in_([h.lower() for h in hidden]))
 
 
 def get_doc_sla_enabled(db: Session) -> bool:

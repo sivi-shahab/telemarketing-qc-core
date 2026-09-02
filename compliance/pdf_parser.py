@@ -13,11 +13,16 @@ Format per PDF (after a header block + separator line)::
     [SPEAKER_0]:
     [00:47.32 -> 01:32.81] teks segmen ...
 """
+import logging
 import os
 import re
 from datetime import datetime
 
 import pdfplumber
+
+from compliance.call_ownership import fix_speaker_roles
+
+logger = logging.getLogger(__name__)
 
 # Strip a trailing duplicate suffix like " (1)" / " (2)" from a filename stem.
 _DUP_SUFFIX_RE = re.compile(r"\s*\(\d+\)\s*$")
@@ -172,6 +177,29 @@ def parse_transcript_pdf(path: str) -> list[dict]:
     return segments
 
 
+def call_duration(path: str) -> str:
+    """Durasi terucap satu PDF, format sama dengan kolom Call Duration ("12m 3s").
+
+    ``build_transcript`` sudah menghitung ini untuk PDF yang ikut dinilai; helper ini
+    untuk PDF yang justru DIBUANG (milik agent lain, lihat
+    ``compliance.call_ownership``) sehingga tidak pernah melewati build_transcript —
+    kolom Call Duration tetap menyebutkan panggilan itu berikut durasinya.
+    """
+    segments = parse_transcript_pdf(path)
+    seconds = _end_timestamp_seconds(segments[-1]["timestamp"]) if segments else 0.0
+    return format_audio_duration(seconds)
+
+
+def transcript_plain_text(path: str) -> str:
+    """Isi PERCAKAPAN satu PDF sebagai teks polos, tanpa blok header.
+
+    Dipakai ``compliance.call_ownership`` untuk mencari perkenalan agent ("saya Alvin
+    dari Bank Mega"). Sengaja tidak membaca teks halaman mentah: blok header memuat
+    baris profil pembicara ("Agent (Agent ) : 307.2 detik") yang bukan ucapan siapa pun.
+    """
+    return "\n".join(seg["text"] for seg in parse_transcript_pdf(path))
+
+
 def _end_timestamp_seconds(timestamp: str) -> float:
     """Convert the *end* of a ``"<start> -> <end>"`` segment timestamp to seconds.
 
@@ -242,7 +270,17 @@ def build_transcript(
     per_file: list[dict] = []
     for call_index, path in enumerate(sorted_paths, start=1):
         ticket_id = ticket_id_from_filename(path)
-        segments = parse_transcript_pdf(path)
+        raw_segments = parse_transcript_pdf(path)
+        # Label "Agent"/"Customer" dari diarization hulu kadang TERTUKAR (31 dari 217
+        # PDF). Diperbaiki di sini, sebelum transkrip dikirim ke LLM: verifikasi statik
+        # card holder menilai UCAPAN NASABAH, jadi peran yang tertukar membuat jawaban
+        # nasabah tidak pernah terhitung. Lihat compliance.call_ownership.
+        segments = fix_speaker_roles(raw_segments)
+        if segments is not raw_segments:
+            logger.warning(
+                "peran pembicara tertukar pada %s — label Agent/Customer ditukar balik",
+                os.path.basename(path),
+            )
         for seg in segments:
             messages.append(
                 {
