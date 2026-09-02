@@ -67,7 +67,13 @@ def _call_legend(messages: list[dict], source_files: list[str] | None) -> list[s
     """``=== DAFTAR PANGGILAN ===`` block: one ``Pn = <ticket_id>`` line per call.
 
     Empty when there are no ``source_files`` — without filenames there is no
-    ticket_id to map a tag to, and an legend of bare numbers teaches nothing."""
+    ticket_id to map a tag to, and an legend of bare numbers teaches nothing.
+
+    Legenda ini sempat membawa penanda tanggal per panggilan (``[TANGGAL SUBMIT]`` /
+    ``[H±n]``) untuk saringan verifikasi statik. Saringan itu dicabut atas konfirmasi
+    Bank Mega — tanggal panggilan tidak menjadi syarat pengambilan bukti — jadi
+    penandanya ikut dibuang: menyisakannya hanya mengundang model memberi bobot pada
+    sesuatu yang tidak lagi menjadi aturan."""
     if not source_files:
         return []
     seen = sorted({m.get("call_index", 1) for m in messages})

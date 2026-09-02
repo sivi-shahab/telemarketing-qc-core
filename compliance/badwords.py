@@ -28,9 +28,11 @@ sekali; semua helper di sini mengembalikan kosong/False untuk hasil seperti itu,
 jadi status tiket lama tidak berubah.
 """
 
-# Komentar yang menemani AI Status = Not Qualified karena badword. Sejajar dengan
-# FRAUD_REASON (compliance/error_codes.py): sebab yang TIDAK terbaca dari skor harus
-# tertulis di kolom AI Status supaya QC tahu alasannya tanpa membuka baris.
+# Komentar yang menemani AI Status = Not Qualified karena badword — satu-satunya
+# sebab yang masih ditulis di kolom AI Status. Sebab yang TIDAK terbaca dari skor
+# perlu tertulis di sana supaya QC tahu alasannya tanpa membuka baris. (Kegagalan
+# konsistensi verifikasi statik dulu punya komentar serupa; sejak 21 Agustus 2026
+# komentarnya dihapus — aturannya tetap, sebabnya dibaca dari kolom Critical Failure.)
 BADWORD_REASON = "Terindikasi Badword"
 
 

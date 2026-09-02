@@ -55,9 +55,15 @@ CARDHOLDER_SINGLE_COLS = {
     "nama_keluarga_relasi": "CUST_GLOCAL_NAME",   # VD_9 (guarantor/relation name)
 }
 # Multi-column card holder fields (joined left->right). Office & home addresses use
-# the FULL Ascend address (street lines + city/province/zip) so the containment/
-# substring match has the complete reference to test the agent's spoken address
-# against; the substring rule still keys off CUST_ADDR1 / CUST_EMP_ADDR1 (first line).
+# the FULL Ascend address (street lines + city/province/zip) so the matcher has the
+# complete reference to test the agent's spoken address against.
+#
+# Sejak prompt v69 (28 Agustus 2026) pencocokannya TOKEN COVERAGE, bukan lagi
+# substring/Levenshtein: prompt memecah kedua sisi jadi token, menyamakan singkatan
+# (jl/jalan, no/nomor, nol di depan RT/RW), MEMBUANG token kode pos 5 digit, lalu
+# menghitung berapa persen token acuan yang benar-benar dibacakan. Konsekuensinya
+# kode pos di ekor join ini tidak lagi ikut dinilai — dibiarkan ada supaya blok
+# reference tetap menampilkan alamat utuh untuk dibaca manusia.
 CARDHOLDER_DOB_COLS = ["CUST_DTE_BIRTH"]
 CARDHOLDER_OFFICE_COLS = [
     "CUST_EMP_NAME",

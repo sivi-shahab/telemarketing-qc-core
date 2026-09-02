@@ -31,6 +31,34 @@ def _numeric_or_none(value):
     return int(value) if value == int(value) else value
 
 
+def no_product_interest(evaluation: dict) -> bool:
+    """True bila nasabah TIDAK berminat pada Mega Cashline MAUPUN Mega Ultima Shield.
+
+    Ini pemicu ZERO-SCORE RULE pada prompt: bila kedua minat bukan "INTERESTED"
+    (sehingga ``campaign_interest`` kosong), skor dipaksa 0 dan AI Status FAIL —
+    tidak peduli berapa item scorecard yang terpenuhi. Alasannya: panggilan yang
+    tidak menghasilkan minat tidak layak dinilai bagus hanya karena prosedurnya
+    rapi.
+
+    Sampai 28 Agustus 2026 aturan ini HANYA hidup di prompt, sehingga hitung ulang
+    deterministik di modul ini melewatkannya: ``max_score`` jatuh ke
+    ``maximum_score`` lalu dikurangi bobot BELUM_SESUAI, menghasilkan skor tinggi
+    dan AI Status PASS untuk tiket yang oleh LLM sudah benar dinyatakan FAIL.
+    Contoh nyata: 0110505ngB -> LLM 0/FAIL, hitung ulang 101.25/PASS.
+
+    Evaluasi lama yang belum punya blok minat sama sekali dikecualikan (return
+    False): tanpa datanya, "tidak berminat" adalah tebakan, dan menebak di sini
+    akan menolkan tiket yang tidak bersalah.
+    """
+    cashline = evaluation.get("cashline_interest")
+    mus = evaluation.get("mus_interest")
+    if not isinstance(cashline, dict) and not isinstance(mus, dict):
+        return False
+    cashline_status = (cashline or {}).get("status")
+    mus_status = (mus or {}).get("status")
+    return cashline_status != "INTERESTED" and mus_status != "INTERESTED"
+
+
 def max_score(evaluation: dict):
     """Skor maksimal = jumlah bobot produk yang diminati (Mega Cashline 108.75 +
     Mega Ultima Shield 41.25); fallback ke ``maximum_score``."""
@@ -48,7 +76,13 @@ def max_score(evaluation: dict):
 
 
 def scorecard_score(evaluation: dict):
-    """Skor scorecard = skor maksimal dikurangi bobot tiap item BELUM_SESUAI."""
+    """Skor scorecard = skor maksimal dikurangi bobot tiap item BELUM_SESUAI.
+
+    ZERO-SCORE RULE didahulukan: nasabah yang tidak berminat pada kedua produk
+    mendapat 0, berapa pun item scorecard yang terpenuhi (lihat
+    ``no_product_interest``)."""
+    if no_product_interest(evaluation):
+        return 0
     max_sc = max_score(evaluation)
     if max_sc is None:
         return None
@@ -76,6 +110,11 @@ def base_ai_status(evaluation: dict):
     """Base AI status 'PASS'/'FAIL' from the deterministic score vs passing grade
     (fallback to the LLM ``ai_status``), WITHOUT the QC override / non-tolerable veto.
     Returns None when it cannot be determined."""
+    # ZERO-SCORE RULE: tanpa minat pada produk mana pun, vonisnya FAIL tanpa
+    # membandingkan skor ke passing grade — skornya sudah dipaksa 0 di atas, tetapi
+    # dinyatakan eksplisit di sini supaya tidak bergantung pada passing_grade > 0.
+    if no_product_interest(evaluation):
+        return "FAIL"
     phase2 = scorecard_score(evaluation)
     verif = _to_num(evaluation.get("ai_score_verification"))
     critical = _to_num(evaluation.get("ai_score_critical_compliance_check"))

@@ -209,19 +209,29 @@ def _sort_key(path: str, idx: int):
     return (ts, idx)
 
 
-def build_transcript(pdf_paths: list[str]) -> tuple[list[str], list[dict], str]:
+def build_transcript(
+    pdf_paths: list[str],
+) -> tuple[list[str], list[dict], str, list[dict]]:
     """Merge multiple transcript PDFs into one chronologically ordered transcript.
 
     PDFs are sorted ascending by their filename timestamp (falling back to mtime,
-    then original order). Returns ``(sorted_filenames, messages, audio_duration)``
-    where each message is
-    ``{"call_index", "ticket_id", "speaker", "timestamp", "text"}`` and
+    then original order). Returns
+    ``(sorted_filenames, messages, audio_duration, per_file_durations)`` where each
+    message is ``{"call_index", "ticket_id", "speaker", "timestamp", "text"}`` and
     ``call_index`` is 1-based per source file in chronological order. The
     ``ticket_id`` is the source filename stem (see ``ticket_id_from_filename``).
 
     ``audio_duration`` is the total spoken duration across all PDFs — the end
     timestamp of the last segment of each PDF summed together — formatted as
     ``"<m>m <s>s"`` (e.g. ``"40m 30s"``).
+
+    ``per_file_durations`` memecah total itu per PDF:
+    ``[{"file": "<nama.pdf>", "duration": "12m 3s"}, ...]`` dalam urutan
+    kronologis yang sama dengan ``sorted_filenames``. Dipakai kolom Call Duration
+    tata letak Demo, yang menyebut durasi tiap panggilan berikut nama berkasnya —
+    angka totalnya saja tidak cukup di sana. PDF yang tidak menghasilkan satu
+    segmen pun tetap masuk daftar dengan ``"0m 0s"``, supaya jumlah butirnya
+    selalu sama dengan jumlah source file.
     """
     indexed = sorted(enumerate(pdf_paths), key=lambda t: _sort_key(t[1], t[0]))
     sorted_paths = [path for _, path in indexed]
@@ -229,6 +239,7 @@ def build_transcript(pdf_paths: list[str]) -> tuple[list[str], list[dict], str]:
 
     messages: list[dict] = []
     total_seconds = 0.0
+    per_file: list[dict] = []
     for call_index, path in enumerate(sorted_paths, start=1):
         ticket_id = ticket_id_from_filename(path)
         segments = parse_transcript_pdf(path)
@@ -242,7 +253,15 @@ def build_transcript(pdf_paths: list[str]) -> tuple[list[str], list[dict], str]:
                     "text": seg["text"],
                 }
             )
-        if segments:
-            total_seconds += _end_timestamp_seconds(segments[-1]["timestamp"])
+        seconds = (
+            _end_timestamp_seconds(segments[-1]["timestamp"]) if segments else 0.0
+        )
+        total_seconds += seconds
+        per_file.append(
+            {
+                "file": os.path.basename(path),
+                "duration": format_audio_duration(seconds),
+            }
+        )
 
-    return sorted_filenames, messages, format_audio_duration(total_seconds)
+    return sorted_filenames, messages, format_audio_duration(total_seconds), per_file

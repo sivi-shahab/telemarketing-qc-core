@@ -4,7 +4,7 @@ services/data_dwh.py
 
 Client HTTP untuk reference data (CASHLINE + CARD HOLDER) yang dulu dibaca dari
 CSV lalu dari DB (tms_cashline / ascend_custp). Sekarang sumbernya API Aplikasi A
-(data warehouse) di API/V1 (port 8000/8002), lewat 2 endpoint:
+(data warehouse) di API/V1 (port 8002), lewat 2 endpoint:
 
     GET {DWH_API_BASE_URL}/campaign/cashline-ntb-asscend/{result_id}  (CACHE, cepat)
     GET {DWH_API_BASE_URL}/campaign/cashline-ntb/{result_id}          (ASLI, fallback)
@@ -31,7 +31,7 @@ berurutan (lihat reference_data.build_reference_data) hanya menembak API sekali.
 Konfigurasi (env var):
   - DWH_API_BASE_URL      base URL API Aplikasi A (default "http://localhost:8002")
   - DWH_API_TIMEOUT_SEC   timeout per request (default 10)
-  - DWH_API_CACHE_TTL_SEC TTL cache in-memory App B per result_id (default 5)
+  - DWH_API_CACHE_TTL_SEC TTL cache in-memory App B per result_id (default 300)
 """
 import logging
 import os
@@ -47,9 +47,19 @@ DWH_API_BASE_URL = os.getenv("DWH_API_BASE_URL", "http://localhost:8002").rstrip
 _API_PATH_CACHE = "/campaign/cashline-ntb-asscend/{result_id}"
 _API_PATH_ORIGINAL = "/campaign/cashline-ntb/{result_id}"
 _TIMEOUT_SEC = float(os.getenv("DWH_API_TIMEOUT_SEC", "10"))
-# TTL cukup untuk menyatukan call cashline + customer dalam satu proses evaluasi,
-# tapi cukup pendek supaya perubahan data cepat kelihatan.
-_CACHE_TTL_SEC = float(os.getenv("DWH_API_CACHE_TTL_SEC", "5"))
+# TTL menyatukan call cashline + customer dalam satu proses evaluasi, DAN menahan
+# hasilnya lintas-request untuk halaman agregat.
+#
+# [FIX] Dulu 5 detik -- LEBIH PENDEK dari satu pass agregat itu sendiri (pass
+# /stats/ai_status_timeseries makan puluhan detik), jadi entry-nya kedaluwarsa di
+# tengah loop dan cid yang sama ditembak ulang: 342 cid unik jadi 566 HTTP request.
+# Halaman Statistik juga auto-refresh tiap 30 detik, sehingga TTL di bawah 30 detik
+# berarti TIDAK ADA satu pun poll yang kena cache. 300 detik menutup keduanya.
+#
+# Ongkosnya: perubahan reference data di DWH baru kelihatan setelah maksimal 5 menit.
+# Aman karena sumbernya sendiri (Job 3 di App A) hanya di-refresh harian; turunkan
+# lewat env var kalau ada alur yang butuh data DWH lebih segar dari itu.
+_CACHE_TTL_SEC = float(os.getenv("DWH_API_CACHE_TTL_SEC", "300"))
 
 _EMPTY_BUNDLE = {"cashline": None, "customer": None}
 

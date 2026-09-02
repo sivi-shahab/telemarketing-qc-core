@@ -16,6 +16,7 @@ from sqlalchemy import func, desc
 # dan filter tanggal di ``list_results``). Definisi modelnya tetap ada di
 # db/models.py sebagai skema tabel.
 from db.models import (
+    AppSetting,
     Campaign,
     Document,
     ErrorCodeAppeal,
@@ -24,6 +25,8 @@ from db.models import (
     QcManualCheck,
     QcStatusEvent,
     QcStatusRequest,
+    ReprocessJob,
+    ReprocessJobItem,
     Result,
     ResultData,
     SalesDatabase,
@@ -483,20 +486,46 @@ def list_results_by_date_range(
 # ---------------------------------------------------------------------------
 # Stats
 # ---------------------------------------------------------------------------
-def get_stats(db: Session) -> dict:
+
+def get_stats(
+    db: Session,
+    customer_ids: Optional[list[str]] = None,
+    campaigns: Optional[list[str]] = None,
+) -> dict:
+    """Hitungan kasar per status upload, DALAM CAKUPAN pemanggil.
+
+    ``customer_ids`` dan ``campaigns`` dimaknai sama dengan di ``list_results``:
+    ``None`` = tanpa batas, daftar KOSONG = tidak ada satu pun yang lolos. Tanpa
+    keduanya endpoint ini melaporkan angka SELURUH organisasi — role yang menu
+    Results-nya kosong tetap membaca "98 tiket" di sini.
+    """
+    if customer_ids is not None and len(customer_ids) == 0:
+        return {
+            "total_uploaded": 0, "pending": 0, "processing": 0, "done": 0,
+            "failed": 0, "avg_processing_sec": None, "active_campaigns": [],
+        }
+    prefix = func.split_part(Result.source_files[0].astext, "_", 1)
+
+    def _scoped(q):
+        return q.filter(prefix.in_(customer_ids)) if customer_ids is not None else q
+
     counts = (
-        db.query(Result.status, func.count(Result.id))
+        _scoped(db.query(Result.status, func.count(Result.id)))
         .group_by(Result.status)
         .all()
     )
     status_map = {row[0]: row[1] for row in counts}
     total = sum(status_map.values())
     avg_row = (
-        db.query(func.avg(Result.processing_sec))
+        _scoped(db.query(func.avg(Result.processing_sec)))
         .filter(Result.status == "done")
         .scalar()
     )
     active_campaigns = [c.name for c in list_campaigns(db) if c.is_active]
+    if campaigns is not None:
+        allowed = {(c or "").strip().casefold() for c in campaigns}
+        active_campaigns = [c for c in active_campaigns if c.strip().casefold() in allowed]
+
     return {
         "total_uploaded": total,
         "pending": status_map.get("pending", 0),
@@ -508,11 +537,20 @@ def get_stats(db: Session) -> dict:
     }
 
 
-def get_daily_stats(db: Session) -> list[dict]:
+def get_daily_stats(db: Session, customer_ids: Optional[list[str]] = None) -> list[dict]:
+    """Upload per hari (30 hari terakhir), DALAM CAKUPAN pemanggil — ``customer_ids``
+    dimaknai sama dengan di ``get_stats``."""
     from sqlalchemy import text
+    if customer_ids is not None and len(customer_ids) == 0:
+        return []
     # uploaded_at is naive UTC; bucket by Asia/Jakarta (WIB) calendar date.
+    scope_sql = (
+        " AND split_part(source_files->>0, '_', 1) = ANY(:cids)"
+        if customer_ids is not None else ""
+    )
+    params = {"cids": list(customer_ids)} if customer_ids is not None else {}
     rows = db.execute(
-        text("""
+        text(f"""
             SELECT
                 ((uploaded_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Jakarta')::date AS day,
                 COUNT(*) AS uploaded,
@@ -521,10 +559,11 @@ def get_daily_stats(db: Session) -> list[dict]:
                 SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
             FROM results
-            WHERE uploaded_at >= NOW() - INTERVAL '30 days'
+            WHERE uploaded_at >= NOW() - INTERVAL '30 days'{scope_sql}
             GROUP BY ((uploaded_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Jakarta')::date
             ORDER BY day DESC
-        """)
+        """),
+        params,
     ).fetchall()
     return [
         {
@@ -735,13 +774,40 @@ def _stats_signature(db: Session) -> str:
     #     Total Risk / Submission is the Performa Campaign definition ONLY. The
     #     Risk Base columns stay as context.
     # v10: hierarchy nodes also carry risk_system (O) + risk_new (N).
-    # v11: submit_time (tenggat H+2 & sumbu-x grafik) dibaca dari snapshot
-    #      reference_data, bukan tabel tms_cashline yang sudah kosong — angka
-    #      PENDING & hierarki berubah, jadi cache lama harus gugur.
-    version = "v11"
+    # v11: kebijakan SLA H+2 ikut menentukan isi snapshot (PENDING vs FAIL untuk
+    #      tiket kekurangan dokumen). Tanpa ini, mematikan/menghidupkan sakelarnya
+    #      tidak mengubah apa pun di Statistics sampai ada data baru masuk — angka
+    #      di layar akan bertentangan dengan status di menu Results.
+    # v12: perombakan metrik 28 Agustus 2026 —
+    #      agents[] dapat ``pending`` dan error_rate = Not Qualified / Submissions;
+    #      campaign_monthly dapat ``not_qualified`` dan error_rate = Total Risk /
+    #      tiket Not Qualified, dengan risk base hanya dari tiket FAIL;
+    #      hierarchy dapat ``pending`` + ``tickets`` (daun per ticket id) dan
+    #      menghitung SEMUA risk base tiket Not Qualified, bukan satu tertinggi.
+    # v13: aturan "Data Ascend Kosong" (28 Agustus 2026) — tiket tanpa baris
+    #      ascend_custp dipaksa PENDING, jadi sebaran AI Status bisa berubah tanpa
+    #      ada data baru yang masuk.
+    # v14: pelanggaran non-tolerable menghalangi PENDING (28 Agustus 2026) — tiket
+    #      kekurangan dokumen yang kena item tolerable=NO langsung Not Qualified.
+    # v15: "Data Ascend Kosong" dipindah ke urutan PALING AKHIR (28 Agustus 2026) —
+    #      kini menimpa badword & konsistensi verifikasi statik juga.
+    # v16: kekurangan data acuan digeneralkan (28 Agustus 2026) — TMS kosong /
+    #      agent tidak terpetakan -> Not Qualified, Ascend kosong tetap -> Pending.
+    # v17: SEMUA kekurangan data acuan (transkrip/TMS/agent/Ascend) -> PENDING.
+    # v18: Error Rate Performa Campaign kembali berpenyebut Submission (pembilang
+    #      tetap risk base milik tiket Not Qualified saja).
+    # v19: submit_time (tenggat H+2 & sumbu-x grafik) dan agent_id dibaca dari
+    #      snapshot reference_data, bukan tabel tms_cashline yang sudah kosong —
+    #      angka PENDING & hierarki berubah, jadi cache lama harus gugur.
+    # v20: Hierarki Failure Rate -> Avg Failure Rate (2 September 2026). Penyebutnya
+    #      pindah dari Submissions ke tiket Not Qualified dan hasilnya kelipatan
+    #      (4.5x), bukan persen — lihat ``_avg_of``. Nilainya berubah tanpa ada data
+    #      baru, jadi snapshot lama HARUS gugur.
+    version = "v20"
+    sla = "1" if get_doc_sla_enabled(db) else "0"
     return (
         f"{version}|{res_count}|{res_up}|{res_done}|{rd_count}|{rd_max}"
-        f"|{ap_count}|{ap_rev}|{sales_key}"
+        f"|{ap_count}|{ap_rev}|{sales_key}|sla{sla}"
     )
 
 
@@ -1275,6 +1341,119 @@ def compute_tms_change_flags(cashline_row: Optional[dict]) -> dict:
         "npwp": bool(str(cashline_row.get("no-npwp-new") or "").strip()),
         "nik": bool(str(cashline_row.get("nik-new") or "").strip()),
     }
+
+
+def cashline_change_flags_index(db: Session, cids=None) -> dict[str, dict]:
+    """``{cid: {"kantor","rumah","npwp","nik": bool}}`` dari snapshot cashline yang
+    SUDAH tersimpan di ``result_data.result_json["reference_data"]["cashline"]`` --
+    SATU query SQL, TANPA HTTP ke App A sama sekali.
+
+    Versi batch & lokal dari ``get_tms_cashline_change_flags()`` (di bawah), yang
+    menembak DWH API sekali per cid secara BERURUTAN. Dengan 342 tiket ongkos HTTP-nya
+    ~22 detik dan itulah penyebab utama ``/stats/ai_status_timeseries`` menembus
+    timeout 30 detik di halaman Statistik. Flag-nya tetap dihitung
+    ``compute_tms_change_flags()``, jadi aturannya persis sama -- yang pindah cuma
+    sumber datanya.
+
+    ``cids`` = None -> seluruh dataset; sebuah iterable -> dibatasi ke cid itu saja.
+    cid yang snapshot cashline-nya BELUM ada sengaja TIDAK muncul di hasil (bukan
+    muncul dengan flag serba-False), supaya pemanggil bisa membedakannya dari "sudah
+    dibaca, memang tidak ada perubahan" dan menjatuhkan sisanya ke fallback DWH.
+    """
+    wanted = None
+    if cids is not None:
+        wanted = {str(c).strip() for c in cids if c}
+        if not wanted:
+            return {}
+
+    rows = (
+        db.query(
+            func.split_part(Result.source_files[0].astext, "_", 1).label("cid"),
+            ResultData.result_json["reference_data"]["cashline"].label("cashline"),
+        )
+        .join(ResultData, ResultData.result_id == Result.id)
+        .distinct(Result.id)
+        .order_by(Result.id, desc(ResultData.created_at))
+        .all()
+    )
+
+    index: dict[str, dict] = {}
+    for cid, cashline in rows:
+        key = (cid or "").strip()
+        if not key or (wanted is not None and key not in wanted):
+            continue
+        if not cashline:
+            continue
+        index[key] = compute_tms_change_flags(cashline)
+    return index
+
+
+def reference_snapshot_index(db: Session, cids=None) -> dict[str, dict]:
+    """``{cid: {"cashline": bool, "customer": bool, "agent_id": str|None}}`` dari
+    snapshot ``reference_data`` yang SUDAH tersimpan di
+    ``result_data.result_json["reference_data"]`` -- SATU query SQL, TANPA HTTP.
+
+    Menjawab "acuan tiket ini lengkap atau tidak" (lihat
+    ``compliance.stats_aggregate.data_gap_map``):
+
+    * ``cashline`` False -> tidak ada baris CASHLINE untuk ticket id ini;
+    * ``customer`` False -> baris CARD HOLDER tidak ketemu (dicocokkan App A by
+      ``no-ktpkitas``), jadi seluruh acuan card holder dikirim ``null`` ke LLM.
+
+    Dulu kedua hal itu ditanyakan langsung ke tabel ``tms_cashline`` /
+    ``ascend_custp``. Kedua tabel itu sudah TIDAK diisi lagi sejak reference data
+    pindah ke DWH API, jadi query lama tetap jalan tanpa error tetapi SELALU
+    mengembalikan nol baris -- artinya SETIAP tiket akan dilaporkan "Data TMS
+    Kosong" + "Data Ascend Kosong" dan dipaksa PENDING.
+
+    cid yang result_json-nya BELUM punya ``reference_data`` sama sekali (tiket lama,
+    dievaluasi sebelum snapshot mulai disisipkan) sengaja TIDAK muncul di hasil,
+    sejalan dengan ``cashline_change_flags_index()``: "belum bisa dinilai" harus bisa
+    dibedakan dari "sudah dibaca, memang kosong" supaya tiket lama tidak dituduh
+    kekurangan data yang sebenarnya tidak pernah diperiksa.
+
+    ``cids`` = None -> seluruh dataset; sebuah iterable -> dibatasi ke cid itu saja.
+    """
+    wanted = None
+    if cids is not None:
+        wanted = {str(c).strip() for c in cids if c}
+        if not wanted:
+            return {}
+
+    rows = (
+        db.query(
+            func.split_part(Result.source_files[0].astext, "_", 1).label("cid"),
+            # jsonb_typeof membedakan tiga keadaan yang artinya berbeda: 'object'
+            # (baris acuan ada), 'null' (sudah dicari, tidak ketemu), dan SQL NULL
+            # (key-nya tidak ada sama sekali = snapshot pra-reference_data).
+            func.jsonb_typeof(
+                ResultData.result_json["reference_data"]["cashline"]
+            ).label("cashline_type"),
+            func.jsonb_typeof(
+                ResultData.result_json["reference_data"]["customer"]
+            ).label("customer_type"),
+            ResultData.result_json["reference_data"]["cashline"]["agent_id"]
+            .astext.label("agent_id"),
+        )
+        .join(ResultData, ResultData.result_id == Result.id)
+        .distinct(Result.id)
+        .order_by(Result.id, desc(ResultData.created_at))
+        .all()
+    )
+
+    index: dict[str, dict] = {}
+    for cid, cashline_type, customer_type, agent_id in rows:
+        key = (cid or "").strip()
+        if not key or (wanted is not None and key not in wanted):
+            continue
+        if cashline_type is None and customer_type is None:
+            continue  # snapshot reference_data belum ada -> belum bisa dinilai
+        index[key] = {
+            "cashline": cashline_type == "object",
+            "customer": customer_type == "object",
+            "agent_id": (agent_id or "").strip() or None,
+        }
+    return index
 
 
 def get_tms_cashline_change_flags(db: Session, result_ids: list[str]) -> dict[str, dict]:
@@ -1890,18 +2069,21 @@ def customer_ids_uploaded_by_role(db: Session, role: str) -> list[str]:
 
 def qc_performance_rows(db: Session, campaign: str = None,
                         campaigns: Optional[list[str]] = None) -> list[dict]:
-    """Per-QC assignment/approval tally for the QC table in Hierarki Error Rate.
+    """Per-QC assignment/approval tally for the QC table in Hierarki Failure Rate.
 
     Returns ``[{qc_username, name, assigned, approved, approve_rate}]``.
     ``approved`` counts a QC's manual checks that land on a ticket CURRENTLY
     assigned to them, so a reassigned ticket cannot inflate the old owner's
     count. ``approve_rate`` = approved / assigned (%).
 
+    Di UI kedua kolom itu berlabel **Checked** dan **Checked Rate** (28 Agustus 2026) —
+    kunci payload sengaja dibiarkan supaya dashboard yang ter-cache tetap membacanya.
+
     Computed live rather than from the stats snapshot: the snapshot signature
     tracks results/appeals only, so it would not invalidate when a QC approves
     a ticket and this table would read stale.
     """
-    # Filter campaign (tab Hierarki Error Rate): daftar ticket id milik campaign itu.
+    # Filter campaign (tab Hierarki Failure Rate): daftar ticket id milik campaign itu.
     # ``QcAssignment`` menyimpan ticket_id, bukan campaign, jadi dipetakan lewat
     # prefix nama berkas sumber di ``results`` — sama seperti kolom ID di dashboard.
     # ``campaign`` = pilihan pemakai, ``campaigns`` = batas campaign role (None =
@@ -1991,3 +2173,431 @@ def latest_appeal_for_row(
         if a.error_code == error_code and a.item_code == item_code
     ]
     return match[-1] if match else None
+
+
+# ---------------------------------------------------------------------------
+# Reprocess All Ticket (menu Upload Data, khusus Admin)
+# ---------------------------------------------------------------------------
+
+def _ticket_id_of(row: Result) -> Optional[str]:
+    """Ticket id sebuah Result = prefix sebelum ``_`` pada file sumber pertama.
+
+    Definisi yang sama dipakai di seluruh sistem (``stats._customer_id_from_files``,
+    ``delete_results_by_ticket_id``, ``qc_assignments.ticket_id``); ditulis ulang di
+    sini agar pengelompokan job reproses tidak menyimpang darinya.
+    """
+    files = row.source_files or []
+    if not files or not isinstance(files[0], str) or not files[0]:
+        return None
+    return files[0].split("_", 1)[0]
+
+
+def reprocess_ticket_plan(db: Session, campaigns: list[str]) -> list[dict]:
+    """Rencana reproses: satu entri per UNIQUE ticket id pada ``campaigns``.
+
+    Tiap entri berisi ``ticket_id``, ``campaign``, ``source_result_id`` (row TERBARU
+    milik ticket itu — dari sanalah transkrip PDF disalin) dan ``old_result_ids``
+    (SELURUH row yang ada sekarang untuk ticket itu, termasuk row terbaru tadi).
+
+    Nama campaign dicocokkan case-insensitive dan ter-trim, karena kolom
+    ``results.campaign`` hanyalah string bebas hasil salinan saat upload — bukan FK
+    ke tabel ``campaigns`` — sehingga ejaannya bisa berbeda kapitalisasi dari nama
+    campaign yang dipilih di layar.
+
+    Row tanpa ``source_files`` dilewati: tanpa nama berkas, ticket id-nya tidak bisa
+    ditentukan dan transkripnya tidak bisa ditemukan di storage.
+    """
+    wanted = {(c or "").strip().casefold() for c in (campaigns or []) if (c or "").strip()}
+    if not wanted:
+        return []
+    rows = (
+        db.query(Result)
+        .filter(func.lower(func.trim(Result.campaign)).in_(wanted))
+        .order_by(desc(Result.uploaded_at))
+        .all()
+    )
+    plan: dict[str, dict] = {}
+    for row in rows:  # sudah urut terbaru -> terlama
+        tid = _ticket_id_of(row)
+        if not tid:
+            continue
+        entry = plan.get(tid)
+        if entry is None:
+            plan[tid] = {
+                "ticket_id": tid,
+                "campaign": row.campaign,
+                "source_result_id": str(row.id),
+                "old_result_ids": [str(row.id)],
+            }
+        else:
+            entry["old_result_ids"].append(str(row.id))
+    return list(plan.values())
+
+
+def reprocess_plan_for_tickets(db: Session, ticket_ids: list) -> list[dict]:
+    """Rencana reproses untuk SEKUMPULAN ticket id — satu query, bukan N.
+
+    Dipakai tombol Reprocess All di menu Results, yang daftar tiketnya datang dari
+    filter layar (``_resolve_filtered_results``) dan karena itu tidak bisa
+    dinyatakan sebagai "campaign apa" seperti ``reprocess_ticket_plan``.
+
+    Bentuk tiap entri identik dengan kedua fungsi rencana lainnya, dan pencocokan
+    ticket id-nya memakai ``split_part(source_files[0], '_', 1)`` yang sama —
+    sehingga Reprocess, Delete, dan Reprocess All pada baris yang sama selalu
+    berbicara tentang kumpulan row yang sama.
+
+    Ticket id yang tidak punya row dilewati diam-diam: tiket bisa saja terhapus
+    antara layar memuat daftarnya dan Admin menekan tombolnya.
+    """
+    tids = sorted({(t or "").strip() for t in (ticket_ids or []) if (t or "").strip()})
+    if not tids:
+        return []
+    rows = (
+        db.query(Result)
+        .filter(func.split_part(Result.source_files[0].astext, "_", 1).in_(tids))
+        .order_by(desc(Result.uploaded_at))
+        .all()
+    )
+    plan: dict[str, dict] = {}
+    for row in rows:  # sudah urut terbaru -> terlama
+        tid = _ticket_id_of(row)
+        if not tid:
+            continue
+        entry = plan.get(tid)
+        if entry is None:
+            plan[tid] = {
+                "ticket_id": tid,
+                "campaign": row.campaign,
+                "source_result_id": str(row.id),
+                "old_result_ids": [str(row.id)],
+            }
+        else:
+            entry["old_result_ids"].append(str(row.id))
+    return list(plan.values())
+
+
+def reprocess_plan_for_ticket(db: Session, ticket_id: str) -> Optional[dict]:
+    """Rencana reproses untuk SATU ticket id — bentuknya sama dengan satu entri
+    ``reprocess_ticket_plan``, atau ``None`` bila tiketnya tidak ada.
+
+    Dipakai tombol Reprocess di menu Results. Pencocokan ticket id-nya memakai
+    ``split_part(source_files[0], '_', 1)`` di sisi database, sama persis dengan
+    ``delete_results_by_ticket_id``, sehingga tombol Reprocess dan tombol Delete
+    pada baris yang sama selalu berbicara tentang kumpulan row yang sama.
+
+    ``source_result_id`` adalah row TERBARU milik tiket itu (dari sanalah transkrip
+    PDF disalin), dan ``old_result_ids`` berisi SELURUH row yang ada sekarang —
+    termasuk row terbaru tadi.
+    """
+    tid = (ticket_id or "").strip()
+    if not tid:
+        return None
+    rows = (
+        db.query(Result)
+        .filter(func.split_part(Result.source_files[0].astext, "_", 1) == tid)
+        .order_by(desc(Result.uploaded_at))
+        .all()
+    )
+    if not rows:
+        return None
+    newest = rows[0]
+    return {
+        "ticket_id": tid,
+        "campaign": newest.campaign,
+        "source_result_id": str(newest.id),
+        "old_result_ids": [str(r.id) for r in rows],
+    }
+
+
+def create_reprocess_job(
+    db: Session,
+    campaigns: list[str],
+    plan: list[dict],
+    username: str = None,
+    scope: str = "campaign",
+) -> ReprocessJob:
+    """Simpan satu job beserta seluruh item-nya (satu item per unique ticket id)."""
+    job = ReprocessJob(
+        campaigns=list(campaigns or []),
+        scope=scope,
+        status="running",
+        total_tickets=len(plan),
+        created_by_username=username,
+    )
+    db.add(job)
+    db.flush()  # butuh job.id untuk item-nya
+    for entry in plan:
+        db.add(
+            ReprocessJobItem(
+                job_id=job.id,
+                ticket_id=entry["ticket_id"],
+                campaign=entry.get("campaign"),
+                old_result_ids=entry["old_result_ids"],
+                source_result_id=uuid.UUID(str(entry["source_result_id"])),
+                status="pending",
+            )
+        )
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+def get_reprocess_job(db: Session, job_id: str) -> Optional[ReprocessJob]:
+    return (
+        db.query(ReprocessJob)
+        .filter(ReprocessJob.id == uuid.UUID(str(job_id)))
+        .first()
+    )
+
+
+def list_reprocess_jobs(
+    db: Session, limit: int = 10, scope: Optional[str] = None
+) -> list[ReprocessJob]:
+    q = db.query(ReprocessJob)
+    if scope:
+        q = q.filter(ReprocessJob.scope == scope)
+    return q.order_by(desc(ReprocessJob.created_at)).limit(limit).all()
+
+
+def running_reprocess_job(db: Session, scope: Optional[str] = None) -> Optional[ReprocessJob]:
+    """Job yang masih berjalan, kalau ada — dicari lewat status, bukan dengan
+    memeriksa N job terakhir, supaya job lama yang tersangkut tetap terlihat.
+
+    ``scope`` menyaring jenis job: ``"campaign"`` untuk job massal saja (dipakai
+    layar Reprocess All Ticket saat menyambung kembali job-nya), ``None`` untuk
+    keduanya (dipakai pengaman sebelum menjalankan job massal baru).
+    """
+    q = db.query(ReprocessJob).filter(ReprocessJob.status == "running")
+    if scope:
+        q = q.filter(ReprocessJob.scope == scope)
+    return q.order_by(desc(ReprocessJob.created_at)).first()
+
+
+# Status item yang berarti "tiket ini sedang direproses": belum dikerjakan atau
+# sedang dikerjakan, pada job yang masih berjalan. Dipakai BERSAMA oleh pengaman
+# 409 (`active_reprocess_item_for_ticket`) dan penanda tombol per halaman
+# (`active_reprocess_ticket_ids`) — dua definisi terpisah akan membuat tombol
+# Reprocess berbohong: enable padahal server menolak, atau sebaliknya.
+REPROCESS_ACTIVE_ITEM_STATUSES = ["pending", "processing"]
+
+
+def active_reprocess_item_for_ticket(db: Session, ticket_id: str) -> Optional[ReprocessJobItem]:
+    """Item yang sedang mengantre/berjalan untuk sebuah ticket id, kalau ada.
+
+    Pengaman tombol Reprocess di Results: menekan tombol dua kali akan membuat dua
+    row baru untuk tiket yang sama, dan job yang kalah cepat mencoba menghapus row
+    yang sudah tidak ada. Job yang sudah ``cancelled`` tidak dihitung — itemnya
+    memang tidak akan dikerjakan.
+    """
+    tid = (ticket_id or "").strip()
+    if not tid:
+        return None
+    return (
+        db.query(ReprocessJobItem)
+        .join(ReprocessJob, ReprocessJob.id == ReprocessJobItem.job_id)
+        .filter(
+            ReprocessJobItem.ticket_id == tid,
+            ReprocessJobItem.status.in_(REPROCESS_ACTIVE_ITEM_STATUSES),
+            ReprocessJob.status == "running",
+        )
+        .order_by(desc(ReprocessJobItem.id))
+        .first()
+    )
+
+
+def active_reprocess_ticket_ids(db: Session, ticket_ids: list) -> set:
+    """Dari ``ticket_ids``, mana yang sedang direproses — satu query, bukan N.
+
+    Menu Results memakai ini untuk menahan tombol Reprocess-nya SETELAH refresh
+    atau pindah menu. Tanpa ini layar hanya tahu job yang ia mulai sendiri di sesi
+    itu (``reprocessActive`` di ``ResultsView.vue`` adalah state komponen), jadi
+    begitu komponennya dibuang, tiket yang masih mengantre tampil siap ditekan
+    lagi — dan Admin baru mendapat 409 sesudah mengonfirmasi modalnya.
+
+    Sengaja MENERIMA daftar tiket, bukan mengembalikan seluruh antrean: dipanggil
+    per halaman (<= 100 baris), sementara antreannya bisa ratusan job sekaligus.
+
+    Scope job tidak disaring. Job massal (``campaign``) membekukan row tiket ini
+    juga dan ``reprocess_single_ticket`` memang menolaknya — kalau di sini hanya
+    scope ``ticket`` yang dihitung, tombolnya akan tampil enable selama job massal
+    berjalan lalu ditolak 409.
+    """
+    tids = sorted({t.strip() for t in (ticket_ids or []) if (t or "").strip()})
+    if not tids:
+        return set()
+    rows = (
+        db.query(ReprocessJobItem.ticket_id)
+        .join(ReprocessJob, ReprocessJob.id == ReprocessJobItem.job_id)
+        .filter(
+            ReprocessJobItem.ticket_id.in_(tids),
+            ReprocessJobItem.status.in_(REPROCESS_ACTIVE_ITEM_STATUSES),
+            ReprocessJob.status == "running",
+        )
+        .distinct()
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
+def get_reprocess_item(db: Session, item_id: int) -> Optional[ReprocessJobItem]:
+    return db.query(ReprocessJobItem).filter(ReprocessJobItem.id == item_id).first()
+
+
+def reprocess_job_items(db: Session, job_id: str) -> list[ReprocessJobItem]:
+    return (
+        db.query(ReprocessJobItem)
+        .filter(ReprocessJobItem.job_id == uuid.UUID(str(job_id)))
+        .order_by(ReprocessJobItem.id)
+        .all()
+    )
+
+
+def update_reprocess_item(db: Session, item_id: int, **fields) -> Optional[ReprocessJobItem]:
+    item = get_reprocess_item(db, item_id)
+    if item is None:
+        return None
+    for key, value in fields.items():
+        setattr(item, key, value)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def reprocess_job_counts(db: Session, job_id: str) -> dict:
+    """Jumlah item per status untuk satu job (dasar bar kemajuan di layar)."""
+    rows = (
+        db.query(ReprocessJobItem.status, func.count(ReprocessJobItem.id))
+        .filter(ReprocessJobItem.job_id == uuid.UUID(str(job_id)))
+        .group_by(ReprocessJobItem.status)
+        .all()
+    )
+    counts = {"pending": 0, "processing": 0, "done": 0, "failed": 0, "skipped": 0}
+    for st, n in rows:
+        counts[st] = counts.get(st, 0) + n
+    return counts
+
+
+def cancel_reprocess_job(db: Session, job_id: str) -> Optional[ReprocessJob]:
+    """Tandai job dibatalkan dan lewati item yang BELUM mulai.
+
+    Item yang sedang ``processing`` sengaja dibiarkan selesai: panggilan LLM-nya
+    sudah dibayar, menghentikannya di tengah jalan hanya membuang hasil itu.
+    """
+    job = get_reprocess_job(db, job_id)
+    if job is None or job.status != "running":
+        return job
+    job.status = "cancelled"
+    db.query(ReprocessJobItem).filter(
+        ReprocessJobItem.job_id == job.id,
+        ReprocessJobItem.status == "pending",
+    ).update({"status": "skipped"}, synchronize_session=False)
+    db.commit()
+    db.refresh(job)
+    finish_reprocess_job_if_complete(db, job_id)
+    return job
+
+
+def finish_reprocess_job_if_complete(db: Session, job_id: str) -> Optional[ReprocessJob]:
+    """Tutup job begitu tidak ada lagi item ``pending``/``processing``.
+
+    Dipanggil dari worker setiap kali satu item selesai — job yang dibatalkan tetap
+    berstatus ``cancelled``, hanya ``finished_at``-nya yang terisi.
+    """
+    job = get_reprocess_job(db, job_id)
+    if job is None or job.finished_at is not None:
+        return job
+    counts = reprocess_job_counts(db, job_id)
+    if counts["pending"] or counts["processing"]:
+        return job
+    if job.status == "running":
+        job.status = "done"
+    job.finished_at = datetime.now()
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+def delete_results_by_ids(db: Session, result_ids) -> int:
+    """Hapus row Result tertentu (beserta turunannya lewat ON DELETE CASCADE).
+
+    Dipakai job reproses untuk membuang row LAMA satu ticket id setelah row barunya
+    berstatus ``done``. Berbeda dengan ``delete_results_by_ticket_id`` yang menyapu
+    semua row seticket, di sini yang dihapus HANYA id yang dibekukan saat job
+    dibuat.
+    """
+    ids = [uuid.UUID(str(r)) for r in (result_ids or [])]
+    if not ids:
+        return 0
+    rows = db.query(Result).filter(Result.id.in_(ids)).all()
+    for row in rows:
+        db.delete(row)
+    if rows:
+        db.commit()
+    return len(rows)
+
+
+# --- Kebijakan tingkat aplikasi (app_settings) -----------------------------
+# Sakelar yang dulunya konstanta di kode. Dibaca di jalur panas (setiap baris
+# Results/Statistics memanggil _doc_sla_expired), jadi nilainya di-cache di proses
+# dan hanya menyentuh DB saat cache dingin atau sesudah diubah.
+
+DOC_SLA_SETTING_KEY = "doc_sla_enabled"
+
+# Cache per-proses. None = belum pernah dibaca. Setiap worker/uvicorn punya
+# salinannya sendiri; ``set_app_setting`` hanya membersihkan salinan miliknya, jadi
+# proses lain menyusul saat TTL-nya habis.
+_APP_SETTING_CACHE: dict = {}
+_APP_SETTING_CACHE_AT: dict = {}
+_APP_SETTING_TTL_SEC = 10.0
+
+
+def get_app_setting(db: Session, key: str, default: str = "") -> str:
+    """Nilai setting (string) dengan cache pendek berbasis TTL."""
+    import time
+
+    now = time.monotonic()
+    at = _APP_SETTING_CACHE_AT.get(key)
+    if at is not None and (now - at) < _APP_SETTING_TTL_SEC:
+        return _APP_SETTING_CACHE[key]
+    row = db.query(AppSetting).filter(AppSetting.key == key).first()
+    val = row.value if row is not None else default
+    _APP_SETTING_CACHE[key] = val
+    _APP_SETTING_CACHE_AT[key] = now
+    return val
+
+
+def get_app_setting_row(db: Session, key: str):
+    """Baris mentah ``app_settings`` (untuk menampilkan kapan & oleh siapa diubah).
+    None bila belum pernah disimpan. TIDAK di-cache — hanya dipakai di layar
+    pengaturan, bukan di jalur panas."""
+    return db.query(AppSetting).filter(AppSetting.key == key).first()
+
+
+def set_app_setting(db: Session, key: str, value: str, username: str = None) -> str:
+    """Simpan setting dan segarkan cache proses ini."""
+    row = db.query(AppSetting).filter(AppSetting.key == key).first()
+    if row is None:
+        row = AppSetting(key=key, value=value, updated_by_username=username)
+        db.add(row)
+    else:
+        row.value = value
+        row.updated_by_username = username
+        row.updated_at = datetime.utcnow()
+    db.commit()
+    _APP_SETTING_CACHE.pop(key, None)
+    _APP_SETTING_CACHE_AT.pop(key, None)
+    return value
+
+
+def get_doc_sla_enabled(db: Session) -> bool:
+    """True bila kebijakan tenggat H+2 dokumen pendukung sedang AKTIF.
+
+    Default AKTIF bila barisnya belum ada — sama dengan perilaku konstanta lama,
+    supaya database yang belum sempat di-seed tidak diam-diam mematikan aturannya.
+    """
+    return str(get_app_setting(db, DOC_SLA_SETTING_KEY, "true")).strip().lower() == "true"
+
+
+def set_doc_sla_enabled(db: Session, enabled: bool, username: str = None) -> bool:
+    set_app_setting(db, DOC_SLA_SETTING_KEY, "true" if enabled else "false", username)
+    return enabled

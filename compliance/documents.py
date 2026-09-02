@@ -11,8 +11,11 @@ reference ("acuan") values fetched from the CSVs.
 """
 import importlib
 import os
+import re
 import sys
+import unicodedata
 from datetime import datetime
+from difflib import SequenceMatcher
 
 # Repo root: <repo>/compliance/documents.py -> <repo>. The prompt modules live in
 # <repo>/prompt and are imported lazily (importlib) at task runtime; the celery
@@ -47,6 +50,7 @@ def is_valid_doc_type(doc_type: str) -> bool:
 # the ticket is AI Status PENDING (H+2 SLA, see ``stats_aggregate``); past the SLA
 # it becomes Not Qualified — exactly the same machinery the TMS-change triggers use.
 #
+# Aturan LAMA (tiket yang belum pernah diproses dengan prompt v56):
 #   nama_ibu_kandung  >= 90         -> MATCH, no document needed
 #                     80   ..  < 90 -> KK required   (AI Status PENDING)
 #                     < 80          -> MISMATCH (agent error)
@@ -71,6 +75,54 @@ CARD_HOLDER_DOC_BANDS: dict[str, dict] = {
         "label": "Tanggal Lahir",
     },
 }
+
+# Aturan BARU (revamp verifikasi statik, 21 Agustus 2026 — prompt v56). Hanya
+# ``nama_ibu_kandung`` yang ambangnya berubah; ``tanggal_lahir`` tetap seperti semula.
+#
+#   nama_ibu_kandung  >= 80         -> MATCH, no document needed
+#                     50   ..  < 80 -> KK required   (AI Status PENDING, SLA H+2)
+#                     < 50          -> MISMATCH (agent error, TANPA dokumen)
+#   tanggal_lahir     == 100        -> MATCH  (tidak berubah)
+#                     87.5 .. < 100 -> KTP required
+#                     < 87.5        -> MISMATCH
+CARD_HOLDER_DOC_BANDS_V2: dict[str, dict] = {
+    "nama_ibu_kandung": {
+        "doc_type": "kk",
+        "doc_min": 50.0,
+        "match_min": 80.0,
+        "label": "Nama Ibu Kandung",
+    },
+    "tanggal_lahir": dict(CARD_HOLDER_DOC_BANDS["tanggal_lahir"]),
+}
+
+# Aturan mana yang dipakai TIDAK ditebak dari waktu upload melainkan DICAP ke dalam
+# evaluasi saat tiket diproses (``compliance.static_similarity.stamp_static_rules``):
+# ``evaluation["static_rules_version"] = 2`` untuk tiket yang dievaluasi dengan prompt
+# v56 ke atas. Cap itu membekukan aturan pada versi prompt yang benar-benar dipakai —
+# lebih tepat daripada ambang waktu, yang akan meleset untuk tiket yang di-upload di
+# sekitar jam deploy atau diproses ulang belakangan.
+#
+# Konsekuensinya persis yang diinginkan: band dibaca ulang setiap kali halaman dibuka,
+# tetapi tiket LAMA tetap dibaca dengan tabel lamanya — tidak ada riwayat yang
+# diam-diam dinilai ulang, dan tidak ada tiket yang tiba-tiba PENDING dengan tenggat
+# H+2 yang sudah lama tutup.
+STATIC_RULES_VERSION_KEY = "static_rules_version"
+
+
+def static_rules_version(evaluation) -> int:
+    """Versi aturan verifikasi statik yang membekukan sebuah evaluasi: 2 (revamp 21
+    Agustus 2026) atau 1 (sebelumnya, termasuk semua hasil yang belum punya cap)."""
+    if not isinstance(evaluation, dict):
+        return 1
+    try:
+        return 2 if int(evaluation.get(STATIC_RULES_VERSION_KEY) or 1) >= 2 else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def card_holder_doc_bands(evaluation=None) -> dict:
+    """Tabel band yang berlaku untuk sebuah evaluasi (lihat ``static_rules_version``)."""
+    return CARD_HOLDER_DOC_BANDS_V2 if static_rules_version(evaluation) >= 2 else CARD_HOLDER_DOC_BANDS
 
 
 # The similarity bands are evaluated at READ time from an already-stored
@@ -115,6 +167,28 @@ def _similarity(value) -> float | None:
     return None if num != num else num  # NaN -> None
 
 
+def in_document_band(item, rule, evaluation=None) -> bool:
+    """Baris ini berada di zona abu-abu yang MEWAJIBKAN dokumen pendukung?
+
+    Satu-satunya sumber kebenaran untuk pertanyaan itu — dipakai bersama oleh
+    ``card_holder_doc_requirements`` (dokumen apa yang diminta) dan
+    ``error_codes.apply_static_document_status`` (MATCH -> PENDING/MISMATCH),
+    supaya keduanya tidak pernah berbeda pendapat.
+
+    Murni pembacaan tabel band. Kasus "nama di Ascend terpotong/disingkat" TIDAK
+    lagi ditangani di sini: sejak 24 Agustus 2026 ia diselesaikan satu lapis lebih
+    awal oleh ``static_similarity._align_abbreviations``, yang menyelaraskan ucapan
+    nasabah ke bentuk singkatan Ascend sebelum similarity dihitung. Hasilnya
+    ``similarity_percent`` sendiri sudah benar (010550Vosa: 54% -> 84%), sehingga
+    tabel band cukup dibaca apa adanya dan tidak ada pengecualian yang harus
+    diketahui banyak tempat sekaligus.
+    """
+    if rule is None or not isinstance(item, dict):
+        return False
+    sim = _similarity(item.get("similarity_percent"))
+    return sim is not None and rule["doc_min"] <= sim < rule["match_min"]
+
+
 def card_holder_doc_requirements(result_json) -> list[dict]:
     """Supporting documents required because a STATIC card-holder field landed in
     the grey band above.
@@ -122,11 +196,20 @@ def card_holder_doc_requirements(result_json) -> list[dict]:
     Returns ``[{"field", "doc_type", "similarity", "label"}]`` ordered like
     ``DOCUMENT_TYPES``; empty when nothing is required.
 
-    Only fields the evaluation itself calls ``MATCH`` are considered. A MISMATCH is
-    already an agent error and needs no document — and for the static fields a
-    MISMATCH may carry the INTER-MENTION minimum in ``similarity_percent`` (STATIC
-    VERIFICATION CONSISTENCY RULE) rather than the similarity against Ascend, which
-    must not be read as a band value.
+    Baris yang dihitung: ``MATCH`` (zona abu-abu yang belum diproses status
+    dokumennya) dan ``PENDING`` (zona abu-abu yang dokumennya memang sedang ditunggu —
+    lihat ``error_codes.apply_static_document_status``). Keduanya WAJIB diterima:
+    kalau hanya ``MATCH`` yang dihitung, sebuah baris yang sudah berubah menjadi
+    ``PENDING`` akan kehilangan kewajiban dokumennya dan tenggat H+2-nya berhenti
+    berjalan. ``MISMATCH`` tidak dihitung — itu sudah kesalahan agent dan tidak
+    membutuhkan dokumen.
+
+    Tabel band-nya dipilih dari cap versi pada evaluasi itu sendiri (lihat
+    ``card_holder_doc_bands``). Pada tiket LAMA sebuah MISMATCH statik bisa membawa
+    nilai minimum ANTAR-PENYEBUTAN di ``similarity_percent`` (STATIC VERIFICATION
+    CONSISTENCY RULE yang sudah dihapus untuk tiket baru), bukan kemiripan terhadap
+    Ascend — itu tidak boleh dibaca sebagai nilai band, dan tidak akan terbaca karena
+    barisnya MISMATCH.
     """
     evaluation = _evaluation_of(result_json)
     if evaluation is None:
@@ -134,16 +217,17 @@ def card_holder_doc_requirements(result_json) -> list[dict]:
     items = evaluation.get("card_holder_verification")
     if not isinstance(items, list):
         return []
+    bands = card_holder_doc_bands(evaluation)
     found: dict[str, dict] = {}
     for item in items:
         if not isinstance(item, dict):
             continue
-        rule = CARD_HOLDER_DOC_BANDS.get(item.get("field"))
-        if rule is None or item.get("match") != "MATCH":
+        rule = bands.get(item.get("field"))
+        if rule is None or item.get("match") not in ("MATCH", "PENDING"):
+            continue
+        if not in_document_band(item, rule, evaluation):
             continue
         sim = _similarity(item.get("similarity_percent"))
-        if sim is None or not (rule["doc_min"] <= sim < rule["match_min"]):
-            continue
         found.setdefault(item["field"], {
             "field": item["field"],
             "doc_type": rule["doc_type"],
@@ -161,21 +245,101 @@ def format_similarity(value: float) -> str:
     return f"{value:.1f}".replace(".", ",")
 
 
+# --------------------------------------------------------------------------
+# Cashline data -> dokumen pendukung (24 Agustus 2026).
+# --------------------------------------------------------------------------
+# ``nama_pemilik_rekening`` menentukan apakah dana bisa cair: beda ejaan sekecil
+# apa pun sudah cukup membuat transfer ditolak bank penerima. Ambangnya karena itu
+# 90% (bukan 80% seperti field lain), dan setiap MISMATCH WAJIB dibuktikan dengan
+# **cover buku tabungan**.
+#
+# Sebelum ini kewajibannya HANYA berupa kalimat di ``reason`` yang ditulis LLM —
+# ``db/crud.py`` bahkan mencatat "cover_buku_tabungan still has no trigger at all".
+# Akibatnya QC disuruh mengejar dokumen yang tidak pernah diminta sistem: ia tidak
+# muncul di daftar dokumen wajib, tiketnya tidak pernah PENDING menunggunya, dan
+# slot unggahnya tidak terbuka.
+#
+# Dijadikan pemicu penuh (keputusan 24 Agustus 2026), setara KK/KTP: masuk daftar
+# wajib, membuat tiket PENDING selama tenggat H+2 berjalan, dan menerbitkan B09
+# bila tenggat lewat tanpa unggah. Konsekuensi yang diterima dengan sadar: tiket
+# lama yang tenggatnya sudah lewat langsung terbaca Not Qualified.
+_CASHLINE_DOC_FIELDS = {
+    "nama_pemilik_rekening": {
+        "doc_type": "cover_buku_tabungan",
+        "label": "Nama Pemilik Rekening",
+    },
+}
+
+
+def cashline_doc_requirements(result_json) -> list[dict]:
+    """Dokumen pendukung yang diminta oleh ``cashline_data_verification``.
+
+    Bentuk kembaliannya SAMA dengan ``card_holder_doc_requirements``
+    (``[{"field", "doc_type", "similarity", "label"}]``) supaya kedua sumber
+    kewajiban bisa disatukan pemanggilnya tanpa perlakuan khusus.
+
+    Hanya baris ``MISMATCH`` yang memicu. Berbeda dari verifikasi statik yang
+    zona abu-abunya ditulis ``MATCH``, di sini bank memutuskan zona bawah tetap
+    MISMATCH — skor tetap dipotong DAN dokumen tetap diminta.
+    """
+    evaluation = _evaluation_of(result_json)
+    if evaluation is None:
+        return []
+    items = evaluation.get("cashline_data_verification")
+    if not isinstance(items, list):
+        return []
+    found: dict[str, dict] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rule = _CASHLINE_DOC_FIELDS.get(item.get("field"))
+        if rule is None or item.get("match") != "MISMATCH":
+            continue
+        found.setdefault(item["field"], {
+            "field": item["field"],
+            "doc_type": rule["doc_type"],
+            "similarity": _similarity(item.get("similarity_percent")),
+            "label": rule["label"],
+        })
+    return list(found.values())
+
+
+def required_doc_requirements(result_json) -> list[dict]:
+    """SELURUH dokumen pendukung yang diminta hasil evaluasi — band verifikasi
+    statik (KK/KTP) DITAMBAH cashline (cover buku tabungan).
+
+    Satu-satunya fungsi yang boleh dipakai pemanggil untuk menjawab "dokumen apa
+    yang wajib untuk tiket ini". Memisahkannya per sumber pernah membuat satu
+    jalur tahu dan jalur lain tidak — persis cara cover buku tabungan sebelumnya
+    diminta di kalimat ``reason`` tetapi tidak pernah diwajibkan sistem.
+    """
+    return card_holder_doc_requirements(result_json) + cashline_doc_requirements(result_json)
+
+
+def required_doc_types(result_json) -> list[str]:
+    """Jenis dokumen wajib (statik + cashline), tanpa duplikat, urut DOCUMENT_TYPES."""
+    seen = {req["doc_type"] for req in required_doc_requirements(result_json)}
+    return [t for t in DOCUMENT_TYPES if t in seen]
+
+
 def card_holder_doc_trigger_labels(result_json) -> list[str]:
     """Human labels for the Upload Document "Diperlukan karena:" chips, e.g.
     ``"Nama Ibu Kandung 85% (perlu KK)"``."""
     labels = []
-    for req in card_holder_doc_requirements(result_json):
+    for req in required_doc_requirements(result_json):
         doc_label = DOCUMENT_TYPES.get(req["doc_type"], {}).get("label", req["doc_type"].upper())
-        labels.append(
-            f"{req['label']} {format_similarity(req['similarity'])}% (perlu {doc_label})"
-        )
+        sim = req.get("similarity")
+        pct = f"{format_similarity(sim)}% " if sim is not None else ""
+        labels.append(f"{req['label']} {pct}(perlu {doc_label})")
     return labels
 
 
 def card_holder_doc_types(result_json) -> list[str]:
-    """Just the document types required by the similarity bands."""
-    return [req["doc_type"] for req in card_holder_doc_requirements(result_json)]
+    """Jenis dokumen wajib. Sejak 24 Agustus 2026 mencakup KEDUA sumber (band
+    verifikasi statik + cashline), sehingga seluruh pemanggil lama otomatis ikut
+    mewajibkan cover buku tabungan. Nama lama dipertahankan agar pemanggilnya tidak
+    perlu diubah; ``required_doc_types`` adalah nama yang lebih tepat."""
+    return required_doc_types(result_json)
 
 
 def load_prompt_module(doc_type: str):

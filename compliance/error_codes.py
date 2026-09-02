@@ -197,6 +197,42 @@ ERROR_CODES = {
         "trigger": "Nasabah mengajukan syarat/kondisi untuk menerima penawaran",
         "risk_base": "M",
     },
+    # B27 & B28 — dua kode baru pada sheet Error Reason Bank Mega
+    # (Error Reason - Telemarketing QC_28082026.xlsx). desc / error_type /
+    # error_category disalin APA ADANYA dari sheet, sesuai aturan berkas ini.
+    #
+    # Bedanya B27 dengan B20: B20 soal penawaran yang tidak ditujukan kepada PEMEGANG
+    # KARTU UTAMA (mis. jatuh ke pemegang suplemen atau keluarganya) — orangnya tetap
+    # ada di daftar undangan. B27 soal orang yang memang TIDAK ADA dalam daftar
+    # undangan campaign sama sekali (NTB Eksternal).
+    "B27": {
+        "desc": "Offering bukan kepada Nasabah terundang",
+        "error_type": "Error - Human",
+        # Sheet menaruh B27 di kategori yang SAMA dengan B20 ("Offering bukan kepada
+        # CH"); yang membedakan keduanya hanya kolom Details Error. Disalin apa adanya
+        # — jangan "dirapikan" menjadi kategori sendiri, karena kolom inilah yang
+        # dipakai dashboard sebagai Failure Category dan harus cocok dengan sheet.
+        "error_category": "Offering bukan kepada CH",
+        "source": SOURCE_SCORECARD,
+        "trigger": "Melakukan penawaran bukan kepada nasabah terundang (NTB Eksternal)",
+        "risk_base": "M",
+    },
+    # B28 TIDAK diturunkan dari scorecard_result seperti kode B lainnya, melainkan dari
+    # ``badword_check`` pada evaluasi: satu temuan badword = satu baris B28. Karena itu
+    # sumbernya SOURCE_OTHERS — barisnya tidak menempel pada satu item_code scorecard.
+    # Sampai 28 Agustus 2026 temuan badword hanya tampil di tabel Badword Summary dan
+    # tidak pernah menjadi error code; sheet bank kini menamainya secara resmi.
+    "B28": {
+        "desc": (
+            "Melakukan penawaran dengan kata atau kalimat tidak sopan, sarkas, "
+            "tidak pantas dan bersifat menyinggung"
+        ),
+        "error_type": "Error - Human",
+        "error_category": "Inappropriate Language",
+        "source": SOURCE_OTHERS,
+        "trigger": "Ucapan agent bersentimen negatif kepada nasabah (badword_check)",
+        "risk_base": "M",
+    },
     # Salah jenis dokumen (14 Agustus 2026): berkasnya DATANG, hanya bukan jenis yang
     # diminta — mis. KTP diunggah ke slot NPWP.
     #
@@ -287,8 +323,11 @@ CATEGORY_ERROR_CODES = [
 # Reversible: widen this set (or remove the filter in build_error_code_table) to
 # restore a hidden code. Hidden codes carry no score deduction, so hiding them does
 # not change any score or pass/fail outcome.
+# B27 & B28 ditambahkan 28 Agustus 2026 bersama masuknya kedua kode itu ke sheet
+# Error Reason bank. Keduanya Risk Base "M", jadi begitu muncul ia IKUT menaikkan
+# Total Failure & Failure Rate — itu memang yang dimaksud, bukan efek samping.
 ALLOWED_ERROR_CODES = {"B02", "B03", "B05", "B09", "B10", "B12", "B16",
-                       "B17", "B18", "C03"}
+                       "B17", "B18", "B27", "B28", "C03"}
 
 
 def is_allowed_error_code(code: str) -> bool:
@@ -366,12 +405,58 @@ STATIC_VERIFICATION_ITEMS = {
     "SC_CL_23_1": ("tanggal_lahir", "tanggal lahir"),
     "SC_CL_23_2": ("nama_ibu_kandung", "nama ibu kandung"),
 }
-# field -> label, kebalikan dari peta di atas (dipakai penjelasan indikasi fraud).
+# field -> label, kebalikan dari peta di atas (dipakai penjelasan kegagalan verifikasi statik).
 STATIC_VERIFICATION_ITEMS_BY_FIELD = {
     field: label for field, label in STATIC_VERIFICATION_ITEMS.values()
 }
 # Field yang tunduk pada CEK KONSISTENSI antar-penyebutan (tahap 1).
 STATIC_CONSISTENCY_FIELDS = tuple(STATIC_VERIFICATION_ITEMS_BY_FIELD)
+
+
+def static_verification_pending_reason(field, evaluation: dict) -> str:
+    """Kalimat "reason" untuk item scorecard yang DITANGGUHKAN karena verifikasi
+    statiknya berada di zona abu-abu dan dokumen pendukungnya masih ditunggu.
+
+    Dipakai ``_propagate_verification_to_scorecard`` saat menurunkan SC_CL_23_1 /
+    SC_CL_23_2 ke PENDING. Tanpa penulisan ulang, item itu akan berbunyi PENDING
+    sambil membawa kalimat LLM yang menjelaskan status SESUAI ("nasabah menyebutkan
+    tanggal lahir dengan benar") — persis kebingungan yang dilaporkan pada tiket
+    0602247CJA dan 010753NldX.
+
+    Menyebutkan angka similarity dan jenis dokumen yang ditunggu, supaya QC tahu
+    apa yang harus ditagih tanpa membuka tabel verifikasi.
+    """
+    label = STATIC_VERIFICATION_ITEMS_BY_FIELD.get(field, field)
+    row = {}
+    for v in (evaluation or {}).get("card_holder_verification") or []:
+        if (v or {}).get("field") == field:
+            row = v or {}
+            break
+    sim = row.get("similarity_percent")
+    sim_txt = ""
+    try:
+        if sim is not None:
+            n = float(sim)
+            sim_txt = f" (similarity {int(n) if n == int(n) else n}%)"
+    except (TypeError, ValueError):
+        sim_txt = ""
+
+    doc_txt = ""
+    try:
+        from compliance.documents import card_holder_doc_bands
+
+        rule = card_holder_doc_bands(evaluation).get(field) or {}
+        doc_type = rule.get("doc_type")
+        if doc_type:
+            doc_txt = f" Menunggu dokumen pendukung: {doc_type}."
+    except Exception:
+        # Nama dokumen hanya pelengkap kalimat; kegagalan mengambilnya tidak boleh
+        # menghilangkan alasan penangguhannya.
+        doc_txt = ""
+
+    return (f"Verifikasi statik {label} berada di zona abu-abu{sim_txt} — belum sama "
+            f"dengan Ascend tetapi cukup dekat, sehingga bank meminta dokumen "
+            f"pendukung alih-alih menyalahkan agent.{doc_txt}")
 
 
 def static_verification_failure_reason(item_code, evaluation: dict) -> "str | None":
@@ -406,14 +491,19 @@ def static_verification_failure_reason(item_code, evaluation: dict) -> "str | No
         return (f"Agent tidak menanyakan verifikasi statik {label} "
                 f"(nasabah tidak pernah menyebutkan nilainya)")
     if _reason_says_inconsistent(row.get("reason")):
-        return (f"Agent menanyakan verifikasi statik {label} tetapi penyebutan nasabah "
-                f"tidak konsisten antar pengulangan")
+        # Kebijakan 21 Agustus 2026: kegagalan TAHAP 1 tidak lagi diberi kalimat
+        # khusus. Kolom Critical Failure cukup berbunyi dengan negasi requirement,
+        # sama seperti tiga item kritikal lainnya — QC melihat SEBAB detailnya pada
+        # baris card_holder_verification, bukan pada ringkasan kolom. Aturannya
+        # sendiri TIDAK berubah: barisnya tetap MISMATCH dan tetap menggugurkan tiket.
+        return f"Agent tidak memverifikasi {label} nasabah"
     detail = f'disebut "{extracted}"' + (f', Ascend "{reference}"' if reference else "")
     return (f"Agent menanyakan verifikasi statik {label} tetapi data mismatch "
             f"dengan Ascend ({detail})")
 
 
-def not_fulfilled_reason(item: dict, evaluation: dict = None) -> str:
+def not_fulfilled_reason(item: dict, evaluation: dict = None,
+                         prefer_item_reason: bool = False) -> str:
     """Why a scorecard item is unmet, tagged with its item code, e.g.
     "Agent menyebutkan nama agent" (SC_CL_2) -> "Agent tidak menyebutkan nama agent (SC_CL_2)".
 
@@ -421,6 +511,22 @@ def not_fulfilled_reason(item: dict, evaluation: dict = None) -> str:
     whether the agent failed to ASK or asked and got a non-matching answer — see
     ``static_verification_failure_reason``. Without it the plain negation is used
     (kept for backwards compatibility).
+
+    ``prefer_item_reason`` (28 Agustus 2026): pakai ``reason`` MILIK item scorecard
+    itu bila ada, alih-alih negasi requirement-nya.
+
+    Negasi requirement selalu benar tetapi selalu GENERIK — ia hanya membalik kalimat
+    persyaratan, sehingga tidak pernah bisa menyebut SEBAB spesifik yang ditemukan
+    penilai. Pada tiket 180936d7F2 scorecard SC_CL_7 berbunyi "Agent menyebut bunga
+    2,09% per bulan, tetapi frasa wajib effective rate tidak disebutkan", sedangkan
+    baris Error Code untuk item yang SAMA berbunyi "Agent tidak menjelaskan bunga
+    Mega Cashline" — dua kalimat berbeda untuk satu kegagalan, dan yang generik itu
+    menyesatkan (agent JELAS menjelaskan bunganya; yang salah frasanya).
+
+    Dibuat opt-in, bukan perilaku bawaan: pemanggil satunya
+    (``stats._non_tolerable_reasons``, kolom "Critical Failure" pada tabel Results)
+    memang menghendaki negasi pendek satu baris — lihat catatan kebijakan
+    21 Agustus 2026 di ``static_verification_failure_reason``.
     """
     item = item or {}
     item_code = item.get("item_code")
@@ -428,6 +534,12 @@ def not_fulfilled_reason(item: dict, evaluation: dict = None) -> str:
     special = static_verification_failure_reason(item_code, evaluation)
     if special:
         return f"{special}{suffix}"
+    if prefer_item_reason:
+        # ``clean_reason`` membuang klausa "Rujukan: SC_CL_XX" yang kadang menempel,
+        # sama seperti yang dilakukan cabang error code dari LLM.
+        own = clean_reason(item.get("reason"))
+        if own:
+            return f"{own}{suffix}"
     req = item.get("requirement") or ""
     if not req:
         return f"Item scorecard belum terpenuhi{suffix}."
@@ -461,11 +573,27 @@ def derive_category_summary(evaluation: dict) -> dict:
     the items. The scorecard is the authority (it is what the ticket score is computed
     from), so the summary is derived from it instead of trusted:
 
-      - ``total_weight``    = sum of the category's item weights;
+      - ``total_weight``    = sum of the category's item weights, EXCLUDING items with
+                              status ``TIDAK_DINILAI``;
       - ``earned_score``    = total_weight - weights of its BELUM_SESUAI items, i.e. the
                               same arithmetic as ai_score_phase_2;
-      - ``category_result`` = FAIL when the category has >= 1 BELUM_SESUAI item, else PASS;
+      - ``category_result`` = FAIL when the category has >= 1 BELUM_SESUAI item,
+                              ``TIDAK_DINILAI`` when EVERY item is skipped, else PASS;
       - ``fail_reason``     = the LLM's prose, kept ONLY when the category really fails.
+
+    ITEM ``TIDAK_DINILAI`` TIDAK IKUT DIHITUNG (perbaikan 24 Agustus 2026). Item MUS
+    dilewati ketika nasabah tidak berminat Mega Ultima Shield (MUS SCORECARD
+    CONDITIONAL RULE) dan menurut KB "do not affect the score". Sebelumnya bobotnya
+    tetap dijumlahkan, sehingga:
+      * tiga kategori MUS tampil **PASS dengan nilai penuh** (22,5 + 11,25 + 7,5)
+        padahal tidak satu pun itemnya dinilai — terbaca seolah agent menjalankan
+        seluruh prosedur MUS dengan sempurna; dan
+      * total Ringkasan Kategori menjadi 150 sementara ``maximum_score`` tiket itu
+        108,75 (= 150 - 41,25 bobot MUS), jadi kedua angka di layar yang sama saling
+        bertentangan.
+    Perbaikan ini murni TAMPILAN: ``ai_score_phase_2`` tidak pernah menghitung item
+    ``TIDAK_DINILAI`` (``scorecard_score`` hanya mengurangi bobot item BELUM_SESUAI
+    dari ``max_score``), jadi tidak ada skor atau AI Status yang berubah.
 
     Categories appear in scorecard order, so a category the LLM forgot to summarise
     (32 occurrences on live data) is no longer missing. Display-only: no score, AI Status
@@ -489,22 +617,40 @@ def derive_category_summary(evaluation: dict) -> dict:
         cat = it.get("category")
         if cat not in agg:
             order.append(cat)
-            agg[cat] = {"weight": 0.0, "lost": 0.0, "failed": 0}
+            agg[cat] = {"weight": 0.0, "lost": 0.0, "failed": 0,
+                        "skipped": 0, "assessed": 0}
         bucket = agg[cat]
+        status = str(it.get("status") or "").strip().upper()
+        if status == "TIDAK_DINILAI":
+            # Dilewati: tidak menambah bobot, tidak menambah perolehan. Dihitung
+            # terpisah supaya kategori yang SELURUH itemnya dilewati bisa dikenali.
+            bucket["skipped"] += 1
+            continue
         w = _weight_of(it)
         bucket["weight"] += w
-        if str(it.get("status") or "").strip().upper() == "BELUM_SESUAI":
+        bucket["assessed"] += 1
+        if status == "BELUM_SESUAI":
             bucket["lost"] += w
             bucket["failed"] += 1
     summary = []
     for cat in order:
         b = agg[cat]
         failed = b["failed"] > 0
+        # Seluruh itemnya dilewati -> kategori memang tidak dinilai. Ditampilkan apa
+        # adanya (bukan disembunyikan) supaya QC tetap melihat kategori itu ADA dan
+        # tahu mengapa nihil, bukan mengira laporannya terpotong.
+        skipped_all = b["assessed"] == 0 and b["skipped"] > 0
+        if skipped_all:
+            result = "TIDAK_DINILAI"
+        elif failed:
+            result = "FAIL"
+        else:
+            result = "PASS"
         summary.append({
             "category": cat,
             "total_weight": _tidy_number(b["weight"]),
             "earned_score": _tidy_number(b["weight"] - b["lost"]),
-            "category_result": "FAIL" if failed else "PASS",
+            "category_result": result,
             "fail_reason": (old_reason.get(cat) or None) if failed else None,
         })
     return {**evaluation, "category_summary": summary}
@@ -788,7 +934,9 @@ def build_error_code_table(evaluation: dict) -> list:
             SOURCE_SCORECARD,
             code,
             item.get("item_code"),
-            not_fulfilled_reason(item, evaluation),
+            # Reason baris Error Code = reason item scorecard-nya, supaya kedua tabel
+            # tidak bisa berbunyi berbeda untuk kegagalan yang sama.
+            not_fulfilled_reason(item, evaluation, prefer_item_reason=True),
             _evidence_text(evidence),
             evidence.get("ticket_id") or "",
             timestamp=_evidence_timestamp(evidence),
@@ -899,6 +1047,35 @@ def build_error_code_table(evaluation: dict) -> list:
                 "extracted_value": source_row.get("extracted_value"),
                 "match": source_row.get("match"),
             },
+        )
+
+    # --- 4) Badword -> B28 (Inappropriate Language) ---------------------------
+    # Satu temuan badword = satu baris B28. Sampai 28 Agustus 2026 temuan badword
+    # hanya hidup di tabel "Badword Summary" dan tidak pernah menjadi error code;
+    # sheet bank kini menamainya B28, jadi ia harus ikut terhitung sebagai kegagalan.
+    #
+    # ``item_code`` sengaja KOSONG: temuan ini tidak menempel pada satu item scorecard
+    # mana pun. Konsekuensinya de-dup pada ``add()`` tidak aktif untuk baris ini —
+    # dan itu benar, sebab satu panggilan bisa memuat beberapa ucapan bermasalah yang
+    # masing-masing berdiri sendiri. ``badword_rows`` sendiri sudah melipat temuan
+    # kembar (timestamp + kutipan sama).
+    #
+    # Impor di dalam fungsi, bukan di kepala berkas: ``compliance.badwords`` mengimpor
+    # modul ini untuk kosakata error code, jadi impor tingkat-modul akan melingkar.
+    from compliance.badwords import badword_rows as _badword_rows
+
+    for finding in _badword_rows(evaluation):
+        quote = finding.get("quote") or ""
+        timestamp = finding.get("timestamp") or ""
+        add(
+            SOURCE_OTHERS,
+            "B28",
+            "",
+            finding.get("reason") or "Ucapan agent bersentimen negatif kepada nasabah.",
+            finding.get("evidence") or quote,
+            finding.get("ticket_id") or "",
+            timestamp=timestamp,
+            evidence_quote=quote,
         )
 
     # Hide error codes outside ALLOWED_ERROR_CODES (kept in sync with KB/prompt).
@@ -1321,13 +1498,32 @@ def _propagate_verification_to_scorecard(evaluation: dict) -> dict:
     appeal-adjusted) card_holder_verification match state — the Python mirror of the
     prompt's VERIFICATION -> SCORECARD PROPAGATION rule:
 
-    - static field ``tanggal_lahir``/``nama_ibu_kandung`` MISMATCH -> SC_CL_23_1/SC_CL_23_2.
+    - static field ``tanggal_lahir``/``nama_ibu_kandung`` MISMATCH -> SC_CL_23_1/SC_CL_23_2
+      BELUM_SESUAI.
+    - static field PENDING (zona abu-abu, dokumen pendukung masih ditunggu dalam
+      tenggat H+2) -> item scorecard yang sama ikut PENDING. Lihat di bawah.
     - fewer than 2 of the 9 dynamic params VERIFIED (value MATCH or event_verified) ->
       SC_CL_24 (hybrid KB_CL_24 2-match rule, see card_holder_two_match_satisfied).
 
-    Only ever forces BELUM_SESUAI (item_score 0); a MATCH / >=2-match never restores a
-    SESUAI (to re-pass, QC appeals the scorecard item directly). Non-destructive; does not
-    itself recompute ai_score_phase_2 (callers re-derive the score from scorecard_result).
+    PENDING IKUT DIPROPAGASIKAN (28 Agustus 2026). Sebelumnya hanya MISMATCH yang
+    turun, sehingga baris verifikasi berbunyi PENDING sementara item scorecard-nya
+    tetap SESUAI — dua permukaan yang menjelaskan hal yang sama saling bertentangan
+    di layar yang sama (tiket 0602247CJA tanggal lahir, 010753NldX nama ibu kandung).
+
+    Bedanya dengan MISMATCH: PENDING **tidak memotong skor**. ``item_score`` dibiarkan
+    apa adanya, karena zona abu-abu adalah PENANGGUHAN, bukan vonis — tiketnya sedang
+    menunggu dokumen, belum gagal. Konsekuensinya otomatis benar di seluruh sistem:
+    ``scorecard_score`` hanya mengurangi bobot item BELUM_SESUAI (PENDING tidak
+    dikurangi), ``has_blocking_intolerable_item`` hanya memveto BELUM_SESUAI, dan
+    ``_sync_critical_compliance`` hanya menjatuhkan item kritis yang BELUM_SESUAI —
+    jadi tidak ada score bomb untuk item yang masih ditunggu. Begitu tenggat H+2 lewat
+    tanpa unggahan, ``apply_static_document_status`` mengubah barisnya menjadi
+    MISMATCH dan jalur BELUM_SESUAI yang biasa mengambil alih.
+
+    Only ever forces BELUM_SESUAI (item_score 0) or PENDING (item_score kept); a
+    MATCH / >=2-match never restores a SESUAI (to re-pass, QC appeals the scorecard item
+    directly). Non-destructive; does not itself recompute ai_score_phase_2 (callers
+    re-derive the score from scorecard_result).
 
     ``reason`` item yang dipaksa turun ikut ditulis ulang: teks aslinya ditulis LLM
     untuk menjelaskan status SESUAI ("nasabah menjawab dengan nama yang konsisten"),
@@ -1342,17 +1538,33 @@ def _propagate_verification_to_scorecard(evaluation: dict) -> dict:
         return evaluation
     ch_match = {(v or {}).get("field"): (v or {}).get("match") for v in ch}
     force_belum = set()
+    # code -> field, untuk item yang ditangguhkan (dokumen pendukung masih ditunggu).
+    force_pending = {}
     for field, code in CARD_HOLDER_STATIC_SCORECARD.items():
-        if ch_match.get(field) == "MISMATCH":
+        state = ch_match.get(field)
+        if state == "MISMATCH":
             force_belum.add(code)
+        elif state == "PENDING":
+            force_pending[code] = field
     if not card_holder_two_match_satisfied(ch):
         force_belum.add(CARD_HOLDER_DYNAMIC_SCORECARD)
-    if not force_belum:
+    # BELUM_SESUAI menang bila keduanya entah bagaimana menunjuk item yang sama:
+    # kegagalan yang sudah pasti mengalahkan penangguhan.
+    force_pending = {c: f for c, f in force_pending.items() if c not in force_belum}
+    if not force_belum and not force_pending:
         return evaluation
     new_items = []
     changed = False
     for it in evaluation.get("scorecard_result") or []:
         code = (it or {}).get("item_code")
+        if code in force_pending and (it or {}).get("status") not in ("BELUM_SESUAI", "PENDING"):
+            # item_score SENGAJA tidak disentuh: penangguhan tidak memotong skor.
+            updated = {**it, "status": "PENDING"}
+            updated["reason"] = static_verification_pending_reason(
+                force_pending[code], evaluation)
+            new_items.append(updated)
+            changed = True
+            continue
         if code in force_belum and (it or {}).get("status") != "BELUM_SESUAI":
             updated = {**it, "status": "BELUM_SESUAI", "item_score": 0}
             # Static: sebutkan SEBAB sebenarnya (tidak ditanya / tidak konsisten /
@@ -1503,6 +1715,60 @@ def _restore_scorecard_items(evaluation: dict, codes: set) -> dict:
     return {**evaluation, "scorecard_result": new_items} if changed else evaluation
 
 
+def _restore_critical_items(evaluation: dict, codes: set) -> dict:
+    """Flip ``critical_compliance_check`` items ``FAIL`` -> ``PASS`` untuk ``codes``,
+    lalu kembalikan potongan penaltinya pada ``ai_score_critical_compliance_check``.
+
+    Keempat item kritikal (SC_CL_4/23_1/23_2/37) adalah baris scorecard biasa, jadi
+    apa pun yang memulihkan item scorecard-nya WAJIB memulihkan irisan kritikalnya
+    juga. Tanpa itu tiket bisa berbunyi MATCH + SESUAI di tabel verifikasi & scorecard
+    tetapi tetap membawa penalti kritikal penuh — persis yang terjadi sebelum
+    perbaikan 21 Agustus 2026, ketika ``normalize_static_verification`` memulihkan
+    SC_CL_23_x tanpa menyentuh blok kritikal dan tiketnya tetap Not Qualified dengan
+    skor 150 dari batas 135.
+
+    ``ai_score_critical_compliance_check`` adalah penalti aditif beku
+    (``-(maximum_score/4)`` per item yang FAIL). Tiap item yang dipulihkan
+    mengembalikan tepat satu irisan, dihitung dari nilai bekunya:
+    ``baru = beku * sisa_fail / fail_awal``. Non-destruktif."""
+    if not evaluation or not codes:
+        return evaluation
+    ccc = evaluation.get("critical_compliance_check")
+    if not isinstance(ccc, dict):
+        return evaluation
+    items = ccc.get("checked_items")
+    if not items:
+        return evaluation
+    orig_fail = sum(1 for it in items if (it or {}).get("status") == "FAIL")
+    if orig_fail == 0:
+        return evaluation
+
+    new_items = []
+    flipped = 0
+    for it in items:
+        if (it or {}).get("status") == "FAIL" and (it or {}).get("item_code") in codes:
+            new_items.append({**it, "status": "PASS"})
+            flipped += 1
+        else:
+            new_items.append(it)
+    if flipped == 0:
+        return evaluation
+
+    new_status = "PASS" if all((it or {}).get("status") == "PASS" for it in new_items) else "FAIL"
+    result = {
+        **evaluation,
+        "critical_compliance_check": {**ccc, "status": new_status, "checked_items": new_items},
+    }
+    frozen = evaluation.get("ai_score_critical_compliance_check")
+    if frozen is not None:
+        try:
+            val = float(frozen) * (orig_fail - flipped) / orig_fail
+            result["ai_score_critical_compliance_check"] = int(val) if val == int(val) else val
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return result
+
+
 def _card_holder_static_restore_codes(approved_appeals: list) -> set:
     """Scorecard item_code(s) an approved Card Holder STATIC (B17) remove/change banding
     must also restore. A static field (tanggal_lahir/nama_ibu_kandung) carries a 0
@@ -1535,11 +1801,11 @@ def _has_dynamic_card_holder_appeal(approved_appeals: list) -> bool:
     )
 
 
-# Teks yang WAJIB muncul sebagai alasan tiket yang gugur di TAHAP 1 verifikasi statik
-# (penyebutan nasabah berubah-ubah antar pengulangan). Kebijakan 10 Agustus 2026:
-# jawaban yang berganti-ganti bukan sekadar salah data, melainkan indikasi fraud —
-# tiketnya Not Qualified dan tidak boleh singgah di PENDING/dokumen pendukung.
-FRAUD_REASON = "Indikasi Fraud"
+# Kebijakan 10 Agustus 2026 (aturan) + 21 Agustus 2026 (teks): penyebutan nasabah yang
+# berubah-ubah antar pengulangan tetap menggugurkan tiket — Not Qualified, tidak boleh
+# singgah di PENDING/dokumen pendukung — tetapi TIDAK lagi diberi label "Indikasi
+# Fraud" di permukaan mana pun. Yang menjalankan aturannya adalah
+# ``static_consistency_failures`` di bawah; kalimat khususnya sudah dihapus.
 
 
 def _reason_says_inconsistent(reason) -> bool:
@@ -1548,7 +1814,7 @@ def _reason_says_inconsistent(reason) -> bool:
     Sengaja mencari frasa negatifnya, bukan kata "konsisten" saja: alasan seperti
     "Nasabah konsisten menyebut Zandra, tetapi tidak sama dengan Ascend" justru
     kebalikannya — konsisten tapi gagal di TAHAP 2. Mencocokkan kata telanjang
-    membuat baris itu salah dibaca sebagai kegagalan tahap 1 (indikasi fraud)."""
+    membuat baris itu salah dibaca sebagai kegagalan tahap 1."""
     text = str(reason or "").casefold()
     return "tidak konsisten" in text or "inkonsisten" in text
 
@@ -1573,26 +1839,23 @@ def _is_static_consistency_failure(row: dict) -> bool:
 def static_consistency_failures(evaluation: dict) -> list:
     """Label field statik yang gugur di tahap 1 (penyebutan tidak konsisten).
 
-    Kosong = tidak ada indikasi fraud dari aturan ini."""
+    Kosong = tidak ada kegagalan konsistensi dari aturan ini.
+
+    SELALU kosong untuk evaluasi ber-``static_rules_version`` >= 2: revamp 21 Agustus
+    2026 menghapus aturan konsistensi antar-penyebutan seluruhnya, jadi veto AI Status
+    yang bersandar padanya ikut mati untuk tiket baru. Digatekan di sini, di satu
+    tempat, supaya kalimat sisa dari LLM ("tidak konsisten" yang lolos ke reason) tidak
+    bisa menghidupkan kembali aturan yang sudah dicabut."""
+    from compliance.documents import static_rules_version
+
+    if static_rules_version(evaluation) >= 2:
+        return []
     out = []
     for row in (evaluation or {}).get("card_holder_verification") or []:
         if _is_static_consistency_failure(row):
             out.append(STATIC_VERIFICATION_ITEMS_BY_FIELD.get((row or {}).get("field"))
                        or titleize_field((row or {}).get("field")))
     return out
-
-
-def fraud_fail_reason(evaluation: dict) -> "str | None":
-    """Komentar AI Status untuk tiket yang gugur karena indikasi fraud, atau None.
-
-    Satu-satunya sumber kalimat itu, dipakai bersama oleh kolom AI Status di daftar
-    Results dan sheet ringkasan pada export XLSX — dulu kalimatnya ditulis ulang di
-    tempat pemakaian, yang membuat kedua permukaan bisa berbunyi berbeda untuk tiket
-    yang sama. Sejajar dengan ``compliance.badwords.badword_fail_reason``."""
-    fields = static_consistency_failures(evaluation)
-    if not fields:
-        return None
-    return f"{FRAUD_REASON} — penyebutan {', '.join(fields)} tidak konsisten antar pengulangan"
 
 
 def _format_percent(value) -> str:
@@ -1629,7 +1892,7 @@ def _static_band_reason(row: dict, rule: dict) -> str:
     - di zona abu-abu kata "sesuai"/"cocok" TIDAK dipakai — nilainya memang belum
       sama, itu justru sebabnya dokumen diminta;
     - "tidak konsisten"/"inkonsisten" TIDAK pernah muncul. Frasa itu penanda
-      kegagalan TAHAP 1 (indikasi fraud) yang dibaca ``_reason_says_inconsistent``,
+      kegagalan TAHAP 1 yang dibaca ``_reason_says_inconsistent``,
       sedangkan baris yang sampai ke sini justru sudah LOLOS tahap 1 dan gugur di
       tahap 2. Menuliskannya akan membuat tiket salah divonis fraud.
     """
@@ -1654,6 +1917,32 @@ def _static_band_reason(row: dict, rule: dict) -> str:
             f"sehingga mismatch dengan Ascend.")
 
 
+def _normalize_for_backing(value) -> str:
+    """Bentuk bandingan longgar untuk mencocokkan nilai bersih LLM dengan ucapan
+    mentah: huruf & angka saja, huruf kecil."""
+    return re.sub(r"[^0-9a-z]+", "", str(value or "").casefold())
+
+
+def _source_file_of_value(value, rows: list) -> "str | None":
+    """Nama PDF tempat ``value`` diucapkan — ucapan PALING BARU yang nilainya sama,
+    sejalan dengan aturan seri "yang paling baru menang".
+
+    ``None`` bila nilainya tidak berasal dari ucapan mana pun (mis. nilai bersih LLM
+    yang tidak identik dengan ucapan mentah) atau ucapannya tidak membawa nama berkas
+    (hasil sebelum prompt v56) — pemanggil membiarkan ``source_file`` apa adanya."""
+    found = None
+    for r in rows or []:
+        if r.get("value") == value and str(r.get("source_file") or "").strip():
+            found = str(r["source_file"]).strip()
+    if found:
+        return found
+    for r in rows or []:
+        if _normalize_for_backing(r.get("value")) == _normalize_for_backing(value) and \
+                str(r.get("source_file") or "").strip():
+            found = str(r["source_file"]).strip()
+    return found
+
+
 def normalize_static_verification(evaluation: dict) -> dict:
     """Jadikan verifikasi STATIK card holder deterministik: hitung ulang
     ``similarity_percent`` di Python, pilih penyebutan TERBAIK, lalu tegakkan
@@ -1664,7 +1953,7 @@ def normalize_static_verification(evaluation: dict) -> dict:
        ``reference_value`` vs penyebutan nasabah. Angka LLM terbukti bisa meleset —
        "ARNIYETTI" vs "Sarieti" pernah dilaporkan 44% padahal 56% — dan selisih
        sebesar itu bisa memindahkan tiket melewati ambang 80 / 87,5.
-    2. **Penyebutan terbaik dipakai** (aturan TAHAP 2, KB v21 / prompt v50): setiap
+    2. **Penyebutan terbaik dipakai** (KB v23 / prompt v59, tanpa syarat tanggal): setiap
        elemen ``extracted_mentions`` diadu ke Ascend, yang tertinggi menjadi
        ``extracted_value``. Seri dimenangkan yang paling baru.
     3. **Ambang ditegakkan** seperti di bawah.
@@ -1678,17 +1967,30 @@ def normalize_static_verification(evaluation: dict) -> dict:
     **MATCH** — di zona abu-abu (di bawah ``match_min``) bank meminta dokumen
     pendukung, bukan menyalahkan agent. Di bawah ambang itu MISMATCH.
 
-    DUA PENGECUALIAN, keduanya penting:
+    ATURAN MANA yang dipakai dibaca dari cap ``static_rules_version`` pada evaluasi
+    itu sendiri (``compliance.documents.static_rules_version``) — dicap sekali saat
+    tiket diproses, jadi tiket lama tidak pernah dinilai ulang dengan aturan baru:
 
-    1. Baris yang gagal lewat STATIC VERIFICATION CONSISTENCY RULE tidak disentuh.
-       Pada baris itu ``similarity_percent`` berisi kemiripan ANTAR-PENYEBUTAN
-       nasabah, BUKAN kemiripan terhadap Ascend (lihat catatan yang sama di
-       ``compliance/documents.py``) — membacanya sebagai nilai band akan
-       "menyelamatkan" tiket yang justru gagal karena jawabannya berubah-ubah.
-       Dikenali dari kata "konsisten" pada ``reason``, penanda yang sama yang dipakai
-       ``static_verification_failure_reason``.
-    2. ``similarity_percent`` kosong (SKIPPED_NULL / tidak dilaporkan) — tidak ada
-       angka yang bisa dijadikan dasar, jadi vonis LLM dibiarkan.
+    * **Tiket lama** — seperti sebelumnya, termasuk pengecualian TAHAP 1: baris yang
+      gagal lewat STATIC VERIFICATION CONSISTENCY RULE tidak disentuh, karena di baris
+      itu ``similarity_percent`` berisi kemiripan ANTAR-PENYEBUTAN nasabah, BUKAN
+      terhadap Ascend — membacanya sebagai nilai band akan "menyelamatkan" tiket yang
+      justru gagal karena jawabannya berubah-ubah.
+    * **Tiket baru (revamp 21 Agustus 2026, prompt v56)** — aturan konsistensi
+      DIHAPUS: setiap penyebutan langsung diadu ke Ascend. Sebagai gantinya hanya
+      SELURUH penyebutan nasabah diadu ke Ascend dan yang similarity-nya TERTINGGI
+      dipakai, tanpa syarat tanggal apa pun. Ambang ``nama_ibu_kandung`` juga berubah
+      menjadi 80 (MATCH) / 50 (batas MISMATCH).
+
+    Sempat ada syarat tanggal panggilan (harus setanggal ``submit_time`` TMS, lalu
+    dilonggarkan jadi prioritas berjenjang). **Dicabut atas konfirmasi Bank Mega**:
+    tanggal panggilan tidak menjadi syarat pengambilan bukti verifikasi statik, jadi
+    ucapan dari panggilan mana pun setara. ``source_file`` per ucapan tetap ditulis
+    karena berguna menelusuri bukti.
+
+    SATU PENGECUALIAN yang berlaku untuk kedua aturan: ``similarity_percent`` kosong
+    (SKIPPED_NULL / tidak dilaporkan) dan tidak ada penyebutan yang bisa dihitung —
+    tidak ada angka yang bisa dijadikan dasar, jadi vonis LLM dibiarkan.
 
     Bila sebuah field statik dikoreksi menjadi MATCH, item scorecard 1:1-nya
     (SC_CL_23_1 / SC_CL_23_2) ikut dipulihkan ke SESUAI — sama seperti yang dilakukan
@@ -1704,8 +2006,15 @@ def normalize_static_verification(evaluation: dict) -> dict:
     items = evaluation.get("card_holder_verification")
     if not isinstance(items, list) or not items:
         return evaluation
-    from compliance.documents import CARD_HOLDER_DOC_BANDS
-    from compliance.static_similarity import best_static_match, mention_values
+    from compliance.documents import card_holder_doc_bands, static_rules_version
+    from compliance.static_similarity import (
+        best_static_match,
+        four_digit_year_required,
+        mention_rows,
+    )
+
+    bands = card_holder_doc_bands(evaluation)
+    v2 = static_rules_version(evaluation) >= 2
 
     # --- 1 & 2: similarity dihitung ulang atas penyebutan TERBAIK ---------------
     # ``dirty`` = indeks baris yang angka/vonisnya kita ubah; hanya baris itu yang
@@ -1717,25 +2026,52 @@ def normalize_static_verification(evaluation: dict) -> dict:
     for idx, it in enumerate(items):
         v = it or {}
         field = v.get("field")
-        if field not in STATIC_CONSISTENCY_FIELDS or _is_static_consistency_failure(v):
-            # Gugur TAHAP 1: similarity-nya kemiripan ANTAR-PENYEBUTAN, bukan
-            # terhadap Ascend — tidak boleh dihitung ulang sebagai similarity Ascend.
+        if field not in STATIC_CONSISTENCY_FIELDS:
+            recomputed.append(it)
+            continue
+        if not v2 and _is_static_consistency_failure(v):
+            # Aturan LAMA, gugur TAHAP 1: similarity-nya kemiripan ANTAR-PENYEBUTAN,
+            # bukan terhadap Ascend — tidak boleh dihitung ulang sebagai similarity
+            # Ascend. Pada aturan baru cabang ini tidak ada lagi.
             recomputed.append(it)
             continue
         ref = v.get("reference_value")
         if ref is None or str(ref).strip() == "":
             recomputed.append(it)   # tanpa acuan tidak ada yang bisa dihitung
             continue
-        # Kandidat = seluruh penyebutan nasabah DITAMBAH nilai pilihan LLM. Nilai LLM
-        # wajib ikut karena ia sudah dibersihkan (mis. gelar "Hajah" dibuang, lead-in
-        # phrase dipangkas) sedangkan penyebutan mentah belum: pada satu tiket acuan
-        # "AMINAH" cocok 100% dengan nilai LLM "Aminah" tapi hanya 50% dengan
-        # penyebutan mentah "Hajah Aminah". Karena yang dipilih adalah similarity
-        # TERTINGGI, ikut sertanya nilai LLM membuat hasilnya tidak pernah lebih
-        # buruk dari sebelumnya. Ditaruh PALING BELAKANG supaya menang saat seri
-        # (aturan seri: yang paling baru).
-        # mention_values() menerima objek ber-timestamp (v52) maupun string lama.
-        cands = mention_values(v.get("extracted_mentions"))
+
+        usable = mention_rows(v.get("extracted_mentions"))
+        if not usable:
+            recomputed.append(it)
+            continue
+
+        # ATURAN TAHUN LAHIR 20XX WAJIB 4 DIGIT — diperiksa SEBELUM similarity, karena
+        # vonisnya tidak bergantung pada seberapa cocok tanggalnya: kelahiran 2000-an
+        # yang tahunnya disebut 2 digit adalah kegagalan verifikasi, titik. Ditegakkan
+        # di sini (21 Agustus 2026) karena sebelumnya aturan ini hanya ada di prompt,
+        # dan hitung-ulang similarity di bawah justru MENIMPA vonis LLM: "06 06 05"
+        # untuk kelahiran 2005 dinormalkan menjadi 06062005 -> 100% -> MATCH.
+        if field == "tanggal_lahir":
+            yy = four_digit_year_required(v.get("reference_value"), usable)
+            if yy is not None:
+                recomputed.append({
+                    **v,
+                    "match": "MISMATCH",
+                    "similarity_percent": 0,
+                    "year_digits_violation": True,
+                    "reason": (f"Tahun lahir 20XX wajib disebutkan 4 digit (YYYY); "
+                               f"nasabah hanya menyebut {yy}."),
+                })
+                dirty.add(idx)
+                continue
+
+        cands = [r["value"] for r in usable]
+        # Nilai pilihan LLM ikut jadi kandidat karena ia sudah DIBERSIHKAN (mis. gelar
+        # "Hajah" dibuang, lead-in phrase dipangkas) sedangkan penyebutan mentah belum:
+        # pada satu tiket acuan "AMINAH" cocok 100% dengan nilai LLM "Aminah" tapi
+        # hanya 50% dengan penyebutan mentah "Hajah Aminah". Karena yang dipilih adalah
+        # similarity TERTINGGI, ikut sertanya nilai LLM tidak pernah memperburuk hasil.
+        # Ditaruh PALING BELAKANG supaya menang saat seri (aturan seri: paling baru).
         chosen = v.get("extracted_value")
         if chosen not in (None, "") and chosen not in cands:
             cands = [*cands, chosen]
@@ -1744,10 +2080,18 @@ def normalize_static_verification(evaluation: dict) -> dict:
             recomputed.append(it)
             continue
         value, score = best
-        if v.get("extracted_value") == value and v.get("similarity_percent") == score:
+        source = _source_file_of_value(value, usable)
+        if (
+            v.get("extracted_value") == value
+            and v.get("similarity_percent") == score
+            and (source is None or v.get("source_file") == source)
+        ):
             recomputed.append(it)
             continue
-        recomputed.append({**v, "extracted_value": value, "similarity_percent": score})
+        updated = {**v, "extracted_value": value, "similarity_percent": score}
+        if source is not None:
+            updated["source_file"] = source
+        recomputed.append(updated)
         dirty.add(idx)
     if dirty:
         evaluation = {**evaluation, "card_holder_verification": recomputed}
@@ -1758,7 +2102,7 @@ def normalize_static_verification(evaluation: dict) -> dict:
     restore: set = set()
     for idx, it in enumerate(items):
         v = it or {}
-        rule = CARD_HOLDER_DOC_BANDS.get(v.get("field"))
+        rule = bands.get(v.get("field"))
         sim = v.get("similarity_percent")
         match = v.get("match")
         if (
@@ -1766,15 +2110,19 @@ def normalize_static_verification(evaluation: dict) -> dict:
             or match not in ("MATCH", "MISMATCH")
             or isinstance(sim, bool)
             or not isinstance(sim, (int, float))
-            # Gugur TAHAP 1: ``similarity_percent``-nya kemiripan ANTAR-PENYEBUTAN,
-            # bukan terhadap Ascend — membacanya sebagai nilai band akan
-            # "menyelamatkan" tiket yang justru gagal karena jawabannya berubah-ubah,
-            # dan tahap 4 akan menimpa kalimat "Indikasi Fraud"-nya. Bendera
-            # ``consistency_failed`` (prompt v52) ikut dibaca lewat
+            # ATURAN LAMA — gugur TAHAP 1: ``similarity_percent``-nya kemiripan
+            # ANTAR-PENYEBUTAN, bukan terhadap Ascend, jadi membacanya sebagai nilai
+            # band akan "menyelamatkan" tiket yang justru gagal karena jawabannya
+            # berubah-ubah. Bendera ``consistency_failed`` (prompt v52) dibaca lewat
             # ``_is_static_consistency_failure``; cek teks dipertahankan untuk hasil
-            # lama yang belum punya bendera itu.
-            or _is_static_consistency_failure(v)
-            or _reason_says_inconsistent(v.get("reason"))
+            # lama yang belum punya bendera itu. Pada aturan baru tidak ada lagi
+            # baris seperti ini — prompt v56 tidak menerbitkan keduanya.
+            or (not v2 and (_is_static_consistency_failure(v)
+                            or _reason_says_inconsistent(v.get("reason"))))
+            # Gugur ATURAN TAHUN LAHIR 20XX: vonisnya sudah final (MISMATCH), dan
+            # angkanya bukan similarity terhadap Ascend. Jangan diangkat oleh ambang,
+            # dan jangan meminta dokumen KTP — ini kesalahan agent.
+            or v.get("year_digits_violation") is True
         ):
             new_items.append(it)
             continue
@@ -1795,7 +2143,7 @@ def normalize_static_verification(evaluation: dict) -> dict:
     final = []
     for idx, it in enumerate(new_items):
         v = it or {}
-        rule = CARD_HOLDER_DOC_BANDS.get(v.get("field"))
+        rule = bands.get(v.get("field"))
         sim = v.get("similarity_percent")
         if (
             idx not in dirty
@@ -1805,9 +2153,94 @@ def normalize_static_verification(evaluation: dict) -> dict:
         ):
             final.append(it)
             continue
+        if v.get("year_digits_violation") is True:
+            final.append(it)     # kalimatnya sudah ditulis saat vonis dijatuhkan
+            continue
         final.append({**v, "reason": _static_band_reason(v, rule)})
     result = {**evaluation, "card_holder_verification": final}
-    return _restore_scorecard_items(result, restore)
+    # Item scorecard DAN irisan kritikalnya dipulihkan bersama: keduanya menyatakan
+    # kegagalan yang sama, jadi memisahkannya membuat tiket berbunyi MATCH + SESUAI
+    # sementara penalti kritikalnya tetap utuh.
+    result = _restore_scorecard_items(result, restore)
+    return _restore_critical_items(result, restore)
+
+
+def apply_static_document_status(evaluation: dict, uploaded_types=(), sla_expired: bool = False) -> dict:
+    """Terapkan status dokumen pada baris verifikasi STATIK yang berada di ZONA ABU-ABU.
+
+    Zona abu-abu bukan vonis, melainkan penangguhan: nilainya cukup dekat untuk masuk
+    akal tetapi belum sama dengan Ascend, jadi bank meminta dokumen pendukung. Sampai
+    21 Agustus 2026 keadaan itu ditulis ``MATCH`` pada kolom Match — QC tidak bisa
+    membedakan "cocok" dari "sedang menunggu bukti", dan setelah tenggat lewat pun
+    barisnya tetap ``MATCH`` sehingga skornya tidak pernah dipotong meski dokumennya
+    tak pernah datang.
+
+    Sekarang ada tiga keadaan:
+
+    * dokumen yang diminta **sudah diunggah** -> tetap ``MATCH``, kewajibannya selesai.
+      Cukup jenis dokumennya benar; hasil OCR tidak ikut menentukan, sejalan dengan
+      ``stats_aggregate._missing_docs_map``.
+    * belum diunggah dan **tenggat H+2 BELUM lewat** -> ``PENDING``. Skor tidak
+      dipotong: tiketnya memang sedang menunggu, bukan gagal.
+    * belum diunggah dan **tenggat H+2 SUDAH lewat** -> ``MISMATCH``. Dari sini
+      propagasi yang sudah ada mengambil alih: ``_propagate_verification_to_scorecard``
+      menurunkan SC_CL_23_1/23_2 menjadi BELUM_SESUAI dan ``_sync_critical_compliance``
+      menjatuhkan item kritisnya beserta irisan penaltinya.
+
+    ``uploaded_types`` adalah jenis dokumen yang SUDAH terunggah untuk tiket itu, dan
+    ``sla_expired`` hasil ``stats_aggregate._doc_sla_expired``. Keduanya fakta tingkat
+    tiket yang hanya ada di database, jadi disuntikkan pemanggil — fungsi ini sendiri
+    tidak menyentuh DB.
+
+    Dipanggil SESUDAH ``normalize_static_verification`` (yang menetapkan band) dan
+    SEBELUM applier banding + propagasi. Non-destruktif."""
+    if not evaluation:
+        return evaluation
+    items = evaluation.get("card_holder_verification")
+    if not isinstance(items, list) or not items:
+        return evaluation
+    from compliance.documents import (
+        DOCUMENT_TYPES,
+        card_holder_doc_bands,
+        in_document_band,
+    )
+
+    bands = card_holder_doc_bands(evaluation)
+    have = {str(t).strip() for t in (uploaded_types or ()) if str(t or "").strip()}
+    out = []
+    changed = False
+    for it in items:
+        v = it if isinstance(it, dict) else {}
+        rule = bands.get(v.get("field"))
+        # ``in_document_band`` memikul SELURUH keputusan "perlu dokumen atau tidak",
+        # termasuk pembebasan CAKUPAN TOKEN (nama Ascend yang tercakup penuh di
+        # ucapan nasabah). Harus persis predikat yang dipakai
+        # ``card_holder_doc_requirements`` — bila keduanya berbeda, sebuah baris bisa
+        # dibebaskan dari permintaan dokumen tetapi tetap jatuh ke MISMATCH di sini.
+        if rule is None or v.get("match") != "MATCH" or not in_document_band(v, rule, evaluation):
+            out.append(it)
+            continue
+        doc_type = rule["doc_type"]
+        if doc_type in have:
+            out.append(it)          # dokumennya sudah ada -> tetap MATCH
+            continue
+        if not sla_expired:
+            out.append({**v, "match": "PENDING"})
+            changed = True
+            continue
+        label = DOCUMENT_TYPES.get(doc_type, {}).get("label", str(doc_type).upper())
+        base = str(v.get("reason") or "").strip()
+        base = base[:-1] if base.endswith(".") else base
+        out.append({
+            **v,
+            "match": "MISMATCH",
+            "reason": (f"{base}; dokumen {label} tidak diunggah sampai tenggat H+2 "
+                       f"sehingga verifikasi tidak terbukti." if base else
+                       f"Dokumen {label} tidak diunggah sampai tenggat H+2 sehingga "
+                       f"verifikasi tidak terbukti."),
+        })
+        changed = True
+    return {**evaluation, "card_holder_verification": out} if changed else evaluation
 
 
 def apply_approved_card_holder_appeals(evaluation: dict, approved_appeals: list) -> dict:
@@ -1880,37 +2313,10 @@ def apply_approved_critical_compliance_appeals(evaluation: dict, approved_appeal
     # in apply_approved_card_holder_appeals so a removed B17 lifts the critical slice too.
     approved_codes |= _card_holder_static_restore_codes(approved_appeals)
     # All four critical items are ordinary scorecard rows (SC_CL_4/23_1/23_2/37), so an
-    # approved scorecard appeal on that item_code resolves its critical slice.
-    orig_fail = sum(1 for it in items if (it or {}).get("status") == "FAIL")
-    if orig_fail == 0:
-        return evaluation
-
-    new_items = []
-    flipped = 0
-    for it in items:
-        code = (it or {}).get("item_code")
-        resolved = code in approved_codes
-        if (it or {}).get("status") == "FAIL" and resolved:
-            new_items.append({**it, "status": "PASS"})
-            flipped += 1
-        else:
-            new_items.append(it)
-    if flipped == 0:
-        return evaluation
-
-    new_status = "PASS" if all((it or {}).get("status") == "PASS" for it in new_items) else "FAIL"
-    result = {
-        **evaluation,
-        "critical_compliance_check": {**ccc, "status": new_status, "checked_items": new_items},
-    }
-    frozen = evaluation.get("ai_score_critical_compliance_check")
-    if frozen is not None:
-        try:
-            val = float(frozen) * (orig_fail - flipped) / orig_fail
-            result["ai_score_critical_compliance_check"] = int(val) if val == int(val) else val
-        except (TypeError, ValueError, ZeroDivisionError):
-            pass
-    return result
+    # approved scorecard appeal on that item_code resolves its critical slice. Mekanik
+    # flip + pengembalian irisan penaltinya dipakai bersama ``normalize_static_verification``
+    # lewat ``_restore_critical_items`` — satu salinan logika, satu perilaku.
+    return _restore_critical_items(evaluation, approved_codes)
 
 # ---------------------------------------------------------------------------
 # QC "add error code" bandings — the INVERSE of the remove/verification appliers

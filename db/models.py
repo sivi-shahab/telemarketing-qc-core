@@ -637,3 +637,89 @@ class SalesDatabase(Base):
     uploaded_by_username = Column(String(100))  # who uploaded (Sales Agent)
     uploaded_by_role = Column(String(20))
     created_at = Column(DateTime, server_default=func.now())
+
+
+class ReprocessJob(Base):
+    """Satu perintah "Reprocess All Ticket" (menu Upload Data, khusus Admin).
+
+    Satu job memuat beberapa campaign; per unique ticket id di dalamnya dibuat satu
+    ``ReprocessJobItem``. Job-nya sendiri hanya menyimpan perintahnya (campaign apa,
+    siapa yang menjalankan, kapan) — kemajuannya dihitung dari status item-item-nya,
+    supaya tidak ada dua sumber kebenaran yang bisa berbeda saat worker berjalan
+    paralel.
+
+    ``status``: ``running`` | ``done`` | ``cancelled``. ``cancelled`` diminta lewat
+    API dan dibaca oleh setiap item SEBELUM memanggil LLM — item yang sudah telanjur
+    diproses tetap diselesaikan (menghentikannya di tengah jalan hanya membuang
+    biaya panggilan LLM yang sudah dibayar).
+    """
+    __tablename__ = "reprocess_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaigns = Column(JSONB, nullable=False)  # daftar nama campaign yang dipilih
+    # ``campaign``: job massal dari menu "Reprocess All Ticket" (seluruh tiket pada
+    # campaign yang dipilih). ``ticket``: satu tiket dari tombol Reprocess di menu
+    # Results. Keduanya memakai item & task yang sama; penandanya dipakai supaya
+    # layar Reprocess All Ticket tidak menempel pada job satu-tiket milik orang lain.
+    scope = Column(String(20), nullable=False, default="campaign")
+    status = Column(String(20), nullable=False, default="running")
+    total_tickets = Column(Integer, nullable=False, default=0)
+    created_by_username = Column(String(100))
+    created_at = Column(DateTime, server_default=func.now())
+    finished_at = Column(DateTime)
+
+
+class ReprocessJobItem(Base):
+    """Satu unique ticket id di dalam sebuah ``ReprocessJob``.
+
+    ``old_result_ids`` dibekukan saat job dibuat, BUKAN dicari ulang saat
+    penghapusan: hanya row yang memang sudah ada pada saat perintah diberikan yang
+    boleh dihapus. Tanpa itu, upload yang masuk di tengah job (mis. lewat webhook)
+    ikut terhapus hanya karena ticket id-nya kebetulan sama.
+
+    ``status``: ``pending`` | ``processing`` | ``done`` | ``failed`` | ``skipped``.
+    ``failed`` berarti tiket LAMA dipertahankan apa adanya dan row baru yang gagal
+    dibuang — sebuah tiket tidak pernah berakhir tanpa hasil sama sekali.
+    """
+    __tablename__ = "reprocess_job_items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(
+        UUID(as_uuid=True), ForeignKey("reprocess_jobs.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    ticket_id = Column(String(100), nullable=False, index=True)
+    campaign = Column(String(100))
+    old_result_ids = Column(JSONB, nullable=False)  # daftar UUID (string) row lama
+    # Row lama TERBARU milik ticket ini — dari sinilah transkrip PDF disalin ke row
+    # baru. Selalu termasuk di dalam ``old_result_ids``.
+    source_result_id = Column(UUID(as_uuid=True))
+    # Row baru hasil reproses — inilah satu-satunya row yang tersisa untuk ticket
+    # itu setelah item berstatus ``done``. Dikosongkan lagi pada item ``failed``,
+    # karena row barunya memang dibuang dan yang berlaku kembali adalah row lama.
+    new_result_id = Column(UUID(as_uuid=True))
+    status = Column(String(20), nullable=False, default="pending")
+    deleted_old = Column(Integer, nullable=False, default=0)
+    error_message = Column(Text)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+
+
+class AppSetting(Base):
+    """Kebijakan tingkat aplikasi yang boleh diubah saat berjalan (key/value).
+
+    Dipakai untuk sakelar yang dulunya konstanta di kode dan karena itu butuh edit
+    file + restart container untuk diubah. Baris pertamanya ``doc_sla_enabled``
+    (kebijakan tenggat H+2 dokumen pendukung, sakelarnya ada di menu Results dan
+    hanya role ``admin`` yang boleh mengubahnya).
+
+    ``value`` sengaja TEXT, bukan boolean: tabel ini generik dan sakelar berikutnya
+    belum tentu bertipe boolean. Pembacanya yang mengurus konversi.
+    """
+
+    __tablename__ = "app_settings"
+
+    key = Column(String(100), primary_key=True)
+    value = Column(Text, nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by_username = Column(String(100))
