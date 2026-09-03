@@ -151,6 +151,30 @@ def _has_per_bucket_credentials(settings) -> bool:
     )
 
 
+
+def _minio_region(settings) -> str:
+    """Region yang WAJIB diisi saat MinIO berada di balik nginx (cdn.bankmega.local).
+
+    Tanpa region, SDK minio memanggil GetBucketLocation lebih dulu --
+    ``GET /<bucket>?location=`` -- dan nginx di depan CDN menolak query itu
+    dengan halaman HTML "Forbiden!" (403). SDK lalu gagal mem-parse-nya jadi
+    ``InvalidResponseError: non-XML response from server``, sehingga SETIAP
+    operasi bucket mati sebelum sempat jalan.
+
+    Dengan region diisi, panggilan ?location= dilewati sepenuhnya dan operasi
+    S3 berjalan normal (terbukti: stat_object mengembalikan NoSuchKey berbentuk
+    XML asli, list_objects mengembalikan daftar objek).
+
+    Default "us-east-1" = region bawaan MinIO, jadi aman juga untuk deployment
+    docker lokal yang tidak lewat nginx.
+    """
+    return (
+        getattr(settings, "minio_region", "")
+        or os.getenv("MINIO_REGION", "")
+        or "us-east-1"
+    )
+
+
 def build_multi_bucket_client(settings) -> MultiBucketMinioClient:
     """[NEW] Bangun MultiBucketMinioClient dari Settings -- 1 client Minio
     per bucket, masing-masing pakai access_key/secret_key sendiri, semua
@@ -189,6 +213,7 @@ def build_multi_bucket_client(settings) -> MultiBucketMinioClient:
             access_key=access_key,
             secret_key=secret_key,
             secure=getattr(settings, "minio_secure", False),
+            region=_minio_region(settings),
             http_client=_build_http_client(getattr(settings, "minio_secure", False)),
         )
         logger.info(
@@ -228,5 +253,6 @@ def build_minio_client(settings):
         access_key=settings.minio_access_key,
         secret_key=settings.minio_secret_key,
         secure=secure,
+        region=_minio_region(settings),
         http_client=_build_http_client(secure),
     )
