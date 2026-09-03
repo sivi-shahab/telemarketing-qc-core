@@ -13,11 +13,55 @@ lalu wrapper ini "route" ke client Minio yang SESUAI (yang sudah dibuat
 dengan access_key/secret_key khusus bucket itu).
 """
 import logging
-from typing import Dict
+import os
+import ssl
+from typing import Dict, Optional
 
+import certifi
+import urllib3
 from minio import Minio
+from urllib3.util import Retry, Timeout
 
 logger = logging.getLogger(__name__)
+
+
+def _build_http_client(secure: bool) -> Optional[urllib3.PoolManager]:
+    """PoolManager untuk client MinIO ber-HTTPS; None untuk http biasa.
+
+    Alasannya cdn.bankmega.local: server itu HANYA mengirim sertifikat leaf-nya
+    (``*.bankmega.local``) tanpa CA penerbit ``Bank Mega Local Authority``, dan CA
+    itu tidak tersedia di mana pun -- yang dipercaya host adalah leaf-nya
+    langsung. OpenSSL bawaan Python MENOLAK leaf tanpa issuer ("unable to get
+    local issuer certificate"), sementara curl di host lolos karena memakai
+    partial chain. ``VERIFY_X509_PARTIAL_CHAIN`` menyalakan perilaku yang sama:
+    sertifikat mana pun di trust store boleh menjadi trust anchor.
+
+    Ini TIDAK mematikan verifikasi -- ``CERT_REQUIRED`` dan pemeriksaan hostname
+    tetap menyala, beda dari ``verify=False`` ala ``TMS_API_VERIFY_SSL``.
+    Efeknya justru sertifikat yang dipin.
+
+    Sertifikatnya sendiri dipasang di image (lihat ``COPY certs/bankmegalocal.crt``
+    + ``update-ca-certificates`` di Dockerfile) dan ditunjuk lewat SSL_CERT_FILE,
+    karena certifi tidak ikut membaca trust store sistem.
+
+    timeout/maxsize/retries disamakan dengan PoolManager bawaan minio, sebab
+    memberi ``http_client`` sendiri berarti default-nya tidak terpakai.
+    """
+    if not secure:
+        # http biasa (MinIO docker-internal): default minio sudah benar.
+        return None
+
+    ctx = ssl.create_default_context(
+        cafile=os.environ.get("SSL_CERT_FILE") or certifi.where()
+    )
+    ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    return urllib3.PoolManager(
+        ssl_context=ctx,
+        timeout=Timeout(connect=10, read=10),
+        maxsize=10,
+        retries=Retry(total=5, backoff_factor=0.2,
+                      status_forcelist=[500, 502, 503, 504]),
+    )
 
 
 class MultiBucketMinioClient:
@@ -145,6 +189,7 @@ def build_multi_bucket_client(settings) -> MultiBucketMinioClient:
             access_key=access_key,
             secret_key=secret_key,
             secure=getattr(settings, "minio_secure", False),
+            http_client=_build_http_client(getattr(settings, "minio_secure", False)),
         )
         logger.info(
             "[multi-bucket-minio] Bucket '%s' -> access_key='%s' @ %s (secure=%s)",
@@ -183,4 +228,5 @@ def build_minio_client(settings):
         access_key=settings.minio_access_key,
         secret_key=settings.minio_secret_key,
         secure=secure,
+        http_client=_build_http_client(secure),
     )
