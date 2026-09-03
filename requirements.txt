@@ -2,7 +2,7 @@
 # API dan worker meng-install file ini LEBIH DULU, baru requirements-nya sendiri.
 sqlalchemy
 psycopg2-binary
-minio
+boto3
 openpyxl
 pdfplumber
 requests>=2.31
