@@ -3,16 +3,28 @@
 Kode bersama untuk `telemarketing-qc-api` dan `telemarketing-qc-worker`.
 Repo ini **library** — tidak punya Dockerfile dan tidak menghasilkan image.
 
+## Dokumentasi arsitektur
+
+Dokumen arsitektur sistem berlaku untuk **keempat repo** dan tinggal di repo
+`telemarketing-qc-api`:
+
+| Berkas | Isi |
+|---|---|
+| `telemarketing-qc-api/docs/ARSITEKTUR.md` | Topologi runtime, pembagian compose, alur data, kepemilikan skema DB, integrasi eksternal (App A/App C/object storage S3/LLM), build & deploy, urutan rilis wajib, langkah menjalankan dari nol |
+| `telemarketing-qc-api/docs/README.md` | Indeks seluruh paket dokumentasi (deployment, runbook, data model, API reference, role, scoring) |
+
+Baca `ARSITEKTUR.md` lebih dulu sebelum mengubah apa pun yang menyentuh repo lain.
+
 ## Isi
 
 | Paket | Fungsi |
 |---|---|
 | `db/` | SQLAlchemy models + `crud` (satu-satunya akses DB) |
 | `compliance/` | Evaluator, scoring, error codes, reference data, OCR, PDF parser, agregasi statistik |
-| `services/` | Klien DWH API (`data_dwh`) dan MinIO multi-bucket |
+| `services/` | Klien DWH API (`data_dwh`) dan akses object storage S3 per-bucket lewat boto3 (`s3_buckets`) |
 | `prompt/` | Prompt OCR (KTP/KK/NPWP/cover buku tabungan), di-`importlib` dari `compliance/documents.py` |
-| `sales_lookup.py` | Lookup sales database aktif (xlsx di MinIO): nama agent, join date, new joiner, hierarki TL/AM |
-| `core_config.py` | Konfigurasi milik core (MinIO + bucket sales database) |
+| `sales_lookup.py` | Lookup sales database aktif (xlsx di bucket `vtt-sales-db`): nama agent, join date, new joiner, hierarki TL/AM |
+| `core_config.py` | Konfigurasi milik core (endpoint S3 + kredensial bucket sales database) |
 
 ## Aturan dependensi
 
