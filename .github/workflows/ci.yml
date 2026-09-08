@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Sengaja bukan `pip install -e .`: install biasa memaksa test berjalan
+      # terhadap paket yang benar-benar ter-install, sehingga package-data yang
+      # tidak ikut akan ketahuan di sini, bukan di produksi.
+      - run: pip install ".[test]"
+      - run: pytest -q
+
+  no-leaking-imports:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Core adalah dasar: kalau ia mengimpor api atau worker, dependensinya
+      # melingkar dan image-nya pasti gagal. Dipertahankan dari Jenkinsfile lama.
+      - name: core tidak boleh mengimpor api atau worker
+        run: |
+          if grep -rnE '^\s*(from|import)\s+(api|worker)\b' --include='*.py' src/; then
+            echo "::error::core mengimpor api/worker -- dependensi melingkar"
+            exit 1
+          fi
+          echo "bersih"
