@@ -169,7 +169,7 @@ def non_tolerable_bomb(evaluation: dict) -> float:
     Mengembalikan 0.0 bila tidak ada yang memenuhi syarat atau ``maximum_score``
     tidak diketahui.
     """
-    from compliance.error_codes import CRITICAL_ITEM_CODES
+    from qc_core.compliance.error_codes import CRITICAL_ITEM_CODES
 
     ms = _to_num(evaluation.get("maximum_score"))
     if not ms:
@@ -206,7 +206,7 @@ def score_bomb_items(evaluation: dict) -> list:
     berbeda dari yang sudah tampil. Item non-tolerable diambil dari scorecard, dengan
     item kritis dikecualikan agar tidak muncul dua kali.
     """
-    from compliance.error_codes import CRITICAL_ITEM_CODES
+    from qc_core.compliance.error_codes import CRITICAL_ITEM_CODES
 
     ms = _to_num(evaluation.get("maximum_score")) or 0
     out = []

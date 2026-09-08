@@ -33,9 +33,9 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import false, func
 
-from sales_lookup import NEW_JOINER_THRESHOLD_DAYS, active_sales_map
-from compliance.badwords import has_badword
-from compliance.error_codes import (
+from qc_core.sales_lookup import NEW_JOINER_THRESHOLD_DAYS, active_sales_map
+from qc_core.compliance.badwords import has_badword
+from qc_core.compliance.error_codes import (
     _appeal_kind,
     added_appeals_only,
     apply_added_score_appeals,
@@ -57,9 +57,9 @@ from compliance.error_codes import (
     inject_added_rows,
     override_risk_base_for_new_joiner,
 )
-from compliance.scoring import base_ai_status, has_blocking_intolerable_item
-from db import crud
-from db.models import Result, ResultData, User
+from qc_core.compliance.scoring import base_ai_status, has_blocking_intolerable_item
+from qc_core.db import crud
+from qc_core.db.models import Result, ResultData, User
 
 # submit_time strings look like "2026-06-17 15:24:53" (mirrors
 # sales_lookup._SUBMIT_FORMATS).
@@ -361,7 +361,7 @@ def refresh_doc_sla_cache(db) -> bool:
     ``DOC_SLA_ENABLED``.
     """
     try:
-        from db import crud
+        from qc_core.db import crud
 
         val = crud.get_doc_sla_enabled(db)
     except Exception:
@@ -393,7 +393,7 @@ def refresh_hidden_tickets_cache(db) -> tuple:
     menampilkannya.
     """
     try:
-        from db import crud
+        from qc_core.db import crud
 
         val = crud.get_hidden_ticket_ids(db)
     except Exception:
@@ -424,7 +424,7 @@ def exclude_hidden_results(query):
     ``done_results_query`` dan setiap query ``Result`` lain di modul ini yang tidak
     lewat sana.
     """
-    from db import crud
+    from qc_core.db import crud
 
     return crud.hidden_ticket_filter(query)
 
@@ -656,7 +656,7 @@ def _wrong_document_type(doc_type, ocr_json):
     modul prompt secara lazy dan tidak semestinya ikut ditarik hanya karena agregasi
     statistik di-import.
     """
-    from compliance.documents import wrong_document_type
+    from qc_core.compliance.documents import wrong_document_type
 
     return wrong_document_type(doc_type, ocr_json)
 
@@ -680,7 +680,7 @@ def doc_requirement_labels(result_json) -> list:
     di sana dokumen APA PUN memenuhi syarat, jadi tidak ada satu jenis yang bisa
     disebut. Baris B09 tetap terbit, hanya kalimat alasannya yang lebih umum.
     """
-    from compliance.documents import DOCUMENT_TYPES, card_holder_doc_types
+    from qc_core.compliance.documents import DOCUMENT_TYPES, card_holder_doc_types
 
     return [
         DOCUMENT_TYPES.get(t, {}).get("label", t.upper())
@@ -974,7 +974,7 @@ def manual_status_of(qc_request) -> "str | None":
     ``qc_request`` sendiri (lihat ``manual_review_state``)."""
     if qc_request is None:
         return None
-    from compliance.error_codes import effective_appeal_status
+    from qc_core.compliance.error_codes import effective_appeal_status
     if effective_appeal_status(qc_request) != "approved":
         return None
     value = str(getattr(qc_request, "requested_status", "") or "").strip().upper()
@@ -1012,7 +1012,7 @@ def manual_review_state(qc_request, missing_docs: bool = False) -> "str | None":
       'ditolak'  -> usulan QC ditolak hierarki;
       None       -> tidak ada apa-apa yang perlu ditindak.
     Dipakai antrean menu Pending Check."""
-    from compliance.error_codes import effective_appeal_status
+    from qc_core.compliance.error_codes import effective_appeal_status
     if qc_request is not None:
         eff = effective_appeal_status(qc_request)
         if eff == "approved":
@@ -1084,8 +1084,8 @@ def _missing_docs_map(db, results, eval_by_id: dict | None = None) -> dict:
     memenuhi seperti sebelumnya; menghukum tiket karena antrean OCR belum jalan
     bukan penilaian atas pekerjaan agent.
     """
-    from compliance.documents import card_holder_bands_apply, card_holder_doc_types
-    from compliance.reference_data import get_credit_limit, npwp_required_by_limit
+    from qc_core.compliance.documents import card_holder_bands_apply, card_holder_doc_types
+    from qc_core.compliance.reference_data import get_credit_limit, npwp_required_by_limit
     ids = [str(r.id) for r in results]
     if not ids:
         return {}
@@ -1441,7 +1441,7 @@ def failure_category_columns(db, campaign: str = None, campaigns: list = None,
     data tetapi tidak dikenal KB (``seen``) tetap DITAMBAHKAN di ekor — lebih baik
     tampil di kolom terakhir daripada hilang diam-diam dari laporan.
     """
-    from db.models import Campaign
+    from qc_core.db.models import Campaign
 
     q = db.query(Campaign).filter(Campaign.is_active.is_(True))
     rows = q.order_by(Campaign.id).all()
@@ -1777,7 +1777,7 @@ def _transcript_cell(v: dict):
 
     Beberapa penyebutan ditulis bernomor dan dipisah baris baru dalam satu sel, agar
     tetap satu baris per parameter di XLSX."""
-    from compliance.static_similarity import mention_rows
+    from qc_core.compliance.static_similarity import mention_rows
 
     def _line(r, i=None):
         # Nama PDF ikut ditulis sejak prompt v56: saringan tanggal membuat "ucapan

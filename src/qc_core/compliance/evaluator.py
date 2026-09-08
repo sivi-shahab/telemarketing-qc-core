@@ -13,7 +13,7 @@ import json
 import re
 from datetime import datetime
 
-from compliance.pdf_parser import parse_filename_timestamp, ticket_id_from_filename
+from qc_core.compliance.pdf_parser import parse_filename_timestamp, ticket_id_from_filename
 
 
 def format_transcript_for_llm(messages: list[dict], source_files: list[str] | None = None) -> str:

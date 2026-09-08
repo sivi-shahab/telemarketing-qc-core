@@ -14,7 +14,7 @@ import json
 
 import requests
 
-from compliance.evaluator import _parse_llm_json_object
+from qc_core.compliance.evaluator import _parse_llm_json_object
 
 
 def ocr_document(

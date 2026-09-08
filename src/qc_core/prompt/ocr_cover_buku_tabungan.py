@@ -6,7 +6,7 @@ Verifies three fields read from the document against bank reference values
   - ``nama_pemilik_rekening_acuan``<- column ``nama-di-rekening``
   - ``nomor_rekening_acuan``       <- column ``nomor-rekening``
 """
-from prompt._common import REQUIRED, fmt_acuan, make_props, make_schema
+from qc_core.prompt._common import REQUIRED, fmt_acuan, make_props, make_schema
 
 DOC_LABEL = "Cover Buku Tabungan"
 

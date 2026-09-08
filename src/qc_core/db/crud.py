@@ -16,7 +16,7 @@ from sqlalchemy import func, desc
 # seluruh pemakaiannya di file ini sudah dialihkan (lihat ``tms_submit_time_map``
 # dan filter tanggal di ``list_results``). Definisi modelnya tetap ada di
 # db/models.py sebagai skema tabel.
-from db.models import (
+from qc_core.db.models import (
     AppSetting,
     Campaign,
     Document,
@@ -36,7 +36,7 @@ from db.models import (
 )
 # Reference data (CASHLINE / CARD HOLDER) sekarang dari DWH API (Aplikasi A),
 # bukan lagi tabel DB -> lihat services/data_dwh.py.
-from services import data_dwh
+from qc_core.services import data_dwh
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +436,7 @@ def list_transcripts(
         # acuan. Tanpa itu setiap tiket yang sedang menunggu dokumen terbaca FAIL di
         # sini, sehingga menu Transcripts memasukkannya ke filter "Reject" padahal di
         # daftar Results tiket itu PENDING.
-        from compliance.stats_aggregate import ai_status_map
+        from qc_core.compliance.stats_aggregate import ai_status_map
 
         ai_map = ai_status_map(db, results)
         results = [r for r in results if ai_map.get(str(r.id)) == ai_filter]
@@ -566,7 +566,7 @@ def get_daily_stats(db: Session, customer_ids: Optional[list[str]] = None) -> li
     # Tiket tersembunyi dikeluarkan juga di sini. Fungsi ini SQL mentah, jadi
     # ``hidden_ticket_filter`` (yang bekerja pada query SQLAlchemy) tidak bisa dipakai —
     # predikatnya ditulis ulang dengan ekspresi ticket id yang sama persis.
-    from compliance.stats_aggregate import hidden_ticket_ids
+    from qc_core.compliance.stats_aggregate import hidden_ticket_ids
 
     hidden = [h.lower() for h in hidden_ticket_ids()]
     hidden_sql = ""
@@ -875,7 +875,7 @@ def get_or_build_stats_snapshot(db: Session, force: bool = False) -> dict:
     ):
         return latest.payload
 
-    from compliance.stats_aggregate import compute_stats_snapshot
+    from qc_core.compliance.stats_aggregate import compute_stats_snapshot
 
     payload = compute_stats_snapshot(db)
     payload["_signature"] = sig
@@ -2677,7 +2677,7 @@ def hidden_ticket_filter(query):
     Pemanggil menyuntikkan daftarnya lewat ``compliance.stats_aggregate.hidden_ticket_ids()``
     supaya tidak perlu sesi DB di jalur panas.
     """
-    from compliance.stats_aggregate import hidden_ticket_ids
+    from qc_core.compliance.stats_aggregate import hidden_ticket_ids
 
     hidden = hidden_ticket_ids()
     if not hidden:

@@ -3,7 +3,7 @@
 Verifies the NPWP number read from the document against ``nomor_npwp_acuan``
 (bank reference: column ``no-npwp-new`` of the cashline CSV, by ``result_id``).
 """
-from prompt._common import REQUIRED, fmt_acuan, make_props, make_schema
+from qc_core.prompt._common import REQUIRED, fmt_acuan, make_props, make_schema
 
 DOC_LABEL = "NPWP"
 

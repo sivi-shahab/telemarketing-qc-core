@@ -19,11 +19,11 @@ scoping NIPs come from ``NIP TL`` (column H), ``NIP AM`` (column J) and ``NIP BA
 from datetime import date, datetime
 from typing import Optional
 
-from core_config import get_core_settings, get_minio
+from qc_core.core_config import get_core_settings, get_minio
 # Pembacaan sheet-nya hidup di compliance/ supaya worker bisa ikut memakainya tanpa
 # menarik FastAPI — lihat compliance/sales_roster.py.
-from compliance.sales_roster import JOIN_FORMATS as _JOIN_FORMATS, norm as _norm, parse_roster, to_date as _to_date
-from db import crud
+from qc_core.compliance.sales_roster import JOIN_FORMATS as _JOIN_FORMATS, norm as _norm, parse_roster, to_date as _to_date
+from qc_core.db import crud
 
 NEW_JOINER_THRESHOLD_DAYS = 18
 

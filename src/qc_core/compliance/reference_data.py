@@ -14,9 +14,9 @@ import json
 
 from sqlalchemy.orm import Session
 
-from compliance.pdf_parser import ticket_id_from_filename
-from compliance.riplay import build_tnc_product_reference
-from db import crud
+from qc_core.compliance.pdf_parser import ticket_id_from_filename
+from qc_core.compliance.riplay import build_tnc_product_reference
+from qc_core.db import crud
 
 # --- Reference data field maps ---------------------------------------------
 # Single-column cashline fields: ref field -> cashline column.

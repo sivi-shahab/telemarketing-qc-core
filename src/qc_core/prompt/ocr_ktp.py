@@ -9,7 +9,7 @@ values (from the cashline CSV, by ``result_id``):
     ``rumah-kabupatenkota-new``, ``rumah-provinsi-new``, ``rumah-kode-pos-new``) joined
     with a single space.
 """
-from prompt._common import REQUIRED, fmt_acuan, make_props, make_schema
+from qc_core.prompt._common import REQUIRED, fmt_acuan, make_props, make_schema
 
 DOC_LABEL = "KTP"
 

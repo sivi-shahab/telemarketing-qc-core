@@ -49,7 +49,7 @@ import collections
 import os
 import re
 
-from compliance.static_similarity import levenshtein
+from qc_core.compliance.static_similarity import levenshtein
 
 # Ambang kemiripan nama (persen) untuk mengenali agent yang di-assign pada sebuah
 # panggilan. Diturunkan ke 75 setelah pengukuran 98 tiket: transkrip menulis "Alvin"

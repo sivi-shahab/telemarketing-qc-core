@@ -17,7 +17,7 @@ Sources:
 import re
 from datetime import datetime
 
-from compliance.riplay import check_tms_against_tnc
+from qc_core.compliance.riplay import check_tms_against_tnc
 
 # --- Source groups ----------------------------------------------------------
 SOURCE_SCORECARD = "scorecard"
@@ -445,7 +445,7 @@ def static_verification_pending_reason(field, evaluation: dict) -> str:
 
     doc_txt = ""
     try:
-        from compliance.documents import card_holder_doc_bands
+        from qc_core.compliance.documents import card_holder_doc_bands
 
         rule = card_holder_doc_bands(evaluation).get(field) or {}
         doc_type = rule.get("doc_type")
@@ -1291,7 +1291,7 @@ def build_error_code_table(evaluation: dict) -> list:
     #
     # Impor di dalam fungsi, bukan di kepala berkas: ``compliance.badwords`` mengimpor
     # modul ini untuk kosakata error code, jadi impor tingkat-modul akan melingkar.
-    from compliance.badwords import badword_rows as _badword_rows
+    from qc_core.compliance.badwords import badword_rows as _badword_rows
 
     for finding in _badword_rows(evaluation):
         quote = finding.get("quote") or ""
@@ -1370,7 +1370,7 @@ def _reason_meta(code):
     global _ERROR_REASON_BY_CODE
     if _ERROR_REASON_BY_CODE is None:
         try:
-            from compliance.error_reasons import ERROR_REASONS
+            from qc_core.compliance.error_reasons import ERROR_REASONS
             _ERROR_REASON_BY_CODE = {e.get("code"): e for e in ERROR_REASONS}
         except Exception:
             _ERROR_REASON_BY_CODE = {}
@@ -2260,7 +2260,7 @@ def static_consistency_failures(evaluation: dict) -> list:
     yang bersandar padanya ikut mati untuk tiket baru. Digatekan di sini, di satu
     tempat, supaya kalimat sisa dari LLM ("tidak konsisten" yang lolos ke reason) tidak
     bisa menghidupkan kembali aturan yang sudah dicabut."""
-    from compliance.documents import static_rules_version
+    from qc_core.compliance.documents import static_rules_version
 
     if static_rules_version(evaluation) >= 2:
         return []
@@ -2310,7 +2310,7 @@ def _static_band_reason(row: dict, rule: dict) -> str:
       sedangkan baris yang sampai ke sini justru sudah LOLOS tahap 1 dan gugur di
       tahap 2. Menuliskannya akan membuat tiket salah divonis fraud.
     """
-    from compliance.documents import DOCUMENT_TYPES
+    from qc_core.compliance.documents import DOCUMENT_TYPES
 
     label = rule["label"]
     sim = row.get("similarity_percent")
@@ -2420,8 +2420,8 @@ def normalize_static_verification(evaluation: dict) -> dict:
     items = evaluation.get("card_holder_verification")
     if not isinstance(items, list) or not items:
         return evaluation
-    from compliance.documents import card_holder_doc_bands, static_rules_version
-    from compliance.static_similarity import (
+    from qc_core.compliance.documents import card_holder_doc_bands, static_rules_version
+    from qc_core.compliance.static_similarity import (
         best_static_match,
         four_digit_year_required,
         mention_rows,
@@ -2718,7 +2718,7 @@ def apply_static_document_status(evaluation: dict, uploaded_types=(), sla_expire
     items = evaluation.get("card_holder_verification")
     if not isinstance(items, list) or not items:
         return evaluation
-    from compliance.documents import (
+    from qc_core.compliance.documents import (
         DOCUMENT_TYPES,
         card_holder_doc_bands,
         in_document_band,
@@ -2792,7 +2792,7 @@ def apply_cashline_document_status(evaluation: dict, uploaded_types=(), sla_expi
     items = evaluation.get("cashline_data_verification")
     if not isinstance(items, list) or not items:
         return evaluation
-    from compliance.documents import DOCUMENT_TYPES, _CASHLINE_DOC_FIELDS
+    from qc_core.compliance.documents import DOCUMENT_TYPES, _CASHLINE_DOC_FIELDS
 
     have = {str(t).strip() for t in (uploaded_types or ()) if str(t or "").strip()}
     out, changed = [], False

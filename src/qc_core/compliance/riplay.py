@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Callable, Optional
 
-from compliance.evaluator import _parse_llm_json_object
+from qc_core.compliance.evaluator import _parse_llm_json_object
 
 # --- PDF -> page images ------------------------------------------------------
 

@@ -15,7 +15,7 @@ from functools import lru_cache
 
 from pydantic_settings import BaseSettings
 
-from services.s3_buckets import build_minio_client
+from qc_core.services.s3_buckets import build_minio_client
 
 
 class CoreSettings(BaseSettings):

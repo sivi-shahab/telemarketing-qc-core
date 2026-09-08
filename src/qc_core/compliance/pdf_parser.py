@@ -20,7 +20,7 @@ from datetime import datetime
 
 import pdfplumber
 
-from compliance.call_ownership import fix_speaker_roles
+from qc_core.compliance.call_ownership import fix_speaker_roles
 
 logger = logging.getLogger(__name__)
 

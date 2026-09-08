@@ -4,7 +4,7 @@ Verifies the mother's maiden name read from the document against
 ``nama_ibu_kandung_acuan`` (bank reference: column ``CUST_MOM_NAME`` of the
 ascend/custp CSV, matched by ``CUST_LOCAL_NAME`` == the cashline ``cust_name``).
 """
-from prompt._common import REQUIRED, fmt_acuan, make_props, make_schema
+from qc_core.prompt._common import REQUIRED, fmt_acuan, make_props, make_schema
 
 DOC_LABEL = "KK"
 

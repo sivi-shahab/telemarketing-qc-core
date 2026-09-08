@@ -380,7 +380,7 @@ def normalize_ocr_json(doc_type: str, ocr_json):
     if not numeric:
         return ocr_json
 
-    from prompt._common import normalize_numeric_row
+    from qc_core.prompt._common import normalize_numeric_row
 
     out = dict(ocr_json)
     out["verifications"] = [
@@ -404,7 +404,7 @@ def build_ocr_request(doc_type: str, reference: dict | None = None) -> tuple[str
     empat kesempatan untuk lupa memperbaruinya. Ditempel SESUDAH ``build_prompt``
     supaya tidak ikut ``str.format`` yang mengisi nilai acuan.
     """
-    from prompt._common import DOC_KIND_INSTRUCTION
+    from qc_core.prompt._common import DOC_KIND_INSTRUCTION
 
     module = load_prompt_module(doc_type)
     return module.build_prompt(reference or {}) + DOC_KIND_INSTRUCTION, module.SCHEMA
@@ -434,7 +434,7 @@ def wrong_document_type(doc_type: str, ocr_json) -> "dict | None":
         diperkenalkan. Dokumen lama tidak boleh tiba-tiba melahirkan error code baru.
       * slot yang tidak dikenal katalog.
     """
-    from prompt._common import DOC_KIND_KEY
+    from qc_core.prompt._common import DOC_KIND_KEY
 
     expected = _DOC_KIND_EXPECTED.get(doc_type)
     if expected is None or not isinstance(ocr_json, dict):
