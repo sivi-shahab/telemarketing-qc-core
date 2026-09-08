@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      # Gerbang rilis: tag yang test-nya merah tidak boleh jadi Release.
+      - run: pip install ".[test]" build
+      - run: pytest -q
+      - run: python -m build --wheel
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+
+  notify:
+    needs: release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo: [telemarketing-qc-api, telemarketing-qc-worker]
+    steps:
+      # PAT dengan scope `repo` pada kedua repo tujuan. GITHUB_TOKEN bawaan
+      # TIDAK bisa memicu workflow di repo lain -- ini penyebab paling umum
+      # "dispatch terkirim tapi tidak ada yang terjadi".
+      - name: Beri tahu ${{ matrix.repo }}
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository_owner }}/${{ matrix.repo }}/dispatches" \
+            -f event_type=core-released \
+            -F "client_payload[version]=${{ needs.release.outputs.version }}"
