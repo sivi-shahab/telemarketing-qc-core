@@ -176,3 +176,18 @@ def test_evaluate_embeds_raw_kb_and_scorecard():
     assert "KB:\nKB-RAW-LINE\n[ bukan json" in user
     assert "SCORECARD:\nSC-RAW{ , ]" in user
     assert "(JSON)" not in user
+    # tanpa reference_text tidak ada blok REFERENCE DATA
+    assert "REFERENCE DATA:" not in user
+
+
+def test_evaluate_reference_data_di_antara_scorecard_dan_transkrip():
+    """Urutan blok user message: KB -> SCORECARD -> REFERENCE DATA -> TRANSCRIPT.
+
+    Reference data (per tiket) harus SETELAH scorecard campaign (identik antar-tiket)
+    supaya scorecard tetap masuk awalan yang ter-cache; lihat _build_user_content.
+    """
+    llm = FakeLLM(['{"ok": 1}'])
+    E.evaluate("P", MESSAGES, "KBX", "SCX", llm, "m", reference_text="REF-ROWS")
+    user = llm.chat.completions.seen[0]["messages"][1]["content"]
+    assert "REFERENCE DATA:\nREF-ROWS" in user
+    assert user.index("SCORECARD:") < user.index("REFERENCE DATA:") < user.index("TRANSCRIPT:")
