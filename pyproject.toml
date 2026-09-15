@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telemarketing-qc-core"
+version = "1.0.0"
+description = "Kode bersama telemarketing QC: db, compliance, prompt, services"
+requires-python = ">=3.11"
+dependencies = [
+    "sqlalchemy>=2.0",
+    "psycopg2-binary>=2.9",
+    "boto3>=1.34",
+    "openpyxl>=3.1",
+    "pdfplumber>=0.11",
+    "requests>=2.31",
+    "pydantic-settings>=2.0",
+    # Merender halaman PDF RIPLAY jadi image sebelum dikirim ke model vision
+    # (qc_core/compliance/riplay.py).
+    "pypdfium2>=4.25",
+    # Ikut terbawa pdfplumber, tetapi ditulis eksplisit karena dipakai LANGSUNG
+    # oleh qc_core/compliance/ocr.py -> image_bytes_to_pdf (konversi screenshot
+    # JPEG/PNG jadi PDF satu halaman sebelum masuk jalur OCR yang hanya menerima
+    # PDF). Dependensi langsung tidak boleh bergantung pada dependensi transitif
+    # paket lain -- pdfplumber boleh saja melepasnya suatu saat.
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# WAJIB. error_reasons.json dibaca saat import oleh compliance/error_reasons.py
+# lewat os.path.dirname(__file__); tanpa baris ini wheel-nya lolos build tapi
+# gagal di-import saat runtime.
+"qc_core.compliance" = ["*.json", "*.xlsx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
