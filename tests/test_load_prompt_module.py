@@ -10,7 +10,10 @@ import pytest
 from qc_core.compliance.documents import DOCUMENT_TYPES, load_prompt_module
 
 
-@pytest.mark.parametrize("doc_type", ["ktp", "kk", "npwp", "cover_buku_tabungan"])
+@pytest.mark.parametrize(
+    "doc_type",
+    ["ktp", "kk", "npwp", "cover_buku_tabungan", "mus_exception_confirmation"],
+)
 def test_load_prompt_module_bisa_diimpor(doc_type):
     module = load_prompt_module(doc_type)
     assert hasattr(module, "build_prompt")
