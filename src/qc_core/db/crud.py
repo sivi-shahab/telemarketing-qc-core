@@ -3,12 +3,12 @@ import hashlib
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from threading import Lock
 from typing import Optional
 
 from sqlalchemy.orm import Session
-from sqlalchemy import func, desc
+from sqlalchemy import and_, func, desc, or_
 
 
 # [FIX] ``AscendCustp`` dan ``TmsCashline`` DIHAPUS dari daftar import: kedua tabel
@@ -1006,6 +1006,61 @@ def delete_results_by_ticket_id(db: Session, ticket_id: str) -> int:
     count = len(rows)
     for row in rows:
         db.delete(row)
+    if count:
+        db.commit()
+    return count
+
+
+# Sepotong-sepotong saat menyaring ``ticket_id`` dalam jumlah besar. Delete All
+# bisa menyasar puluhan ribu tiket sekaligus, dan satu ``IN (...)`` sepanjang itu
+# ditolak driver jauh sebelum Postgres sempat melihatnya.
+_TICKET_ID_CHUNK = 1_000
+
+
+def _ticket_id_chunks(ticket_ids) -> list:
+    """``ticket_ids`` yang sudah dibersihkan, dipecah menjadi potongan seukuran IN."""
+    tids = sorted({str(t).strip() for t in (ticket_ids or []) if str(t or "").strip()})
+    return [tids[i:i + _TICKET_ID_CHUNK] for i in range(0, len(tids), _TICKET_ID_CHUNK)]
+
+
+def _results_by_ticket_ids_q(db: Session, chunk: list):
+    return db.query(Result).filter(
+        func.split_part(Result.source_files[0].astext, "_", 1).in_(chunk)
+    )
+
+
+def results_count_by_ticket_ids(db: Session, ticket_ids) -> int:
+    """Berapa baris Result yang dimiliki sekumpulan ticket id.
+
+    Dipakai modal konfirmasi Delete All untuk menyebut ongkos SEBENARNYA:
+    penghapusan memakai ticket id, jadi entry lain milik tiket yang sama ikut
+    hilang walaupun tidak cocok dengan filter di layar. Menghitungnya dari baris
+    yang cocok filter saja akan melaporkan angka yang terlalu kecil.
+    """
+    return sum(_results_by_ticket_ids_q(db, chunk).count() for chunk in _ticket_id_chunks(ticket_ids))
+
+
+def delete_results_by_ticket_ids(db: Session, ticket_ids) -> int:
+    """Versi jamak dari :func:`delete_results_by_ticket_id` — tombol Delete All.
+
+    Menghapus SELURUH baris Result milik tiap ticket id beserta baris turunannya
+    (``result_data``, ``documents``, ``qc_status_requests``, ``error_code_appeals``)
+    lewat ON DELETE CASCADE, dan mengembalikan jumlah baris yang terhapus.
+
+    Satu commit untuk semuanya, bukan satu commit per tiket: perintah ini berangkat
+    dari SATU konfirmasi Admin, jadi separuh terhapus adalah keadaan yang tidak
+    pernah diminta siapa pun. Daftar kosong tidak menyentuh apa pun — penting,
+    karena ``IN ()`` yang kosong justru cocok dengan nol baris dan sebuah salah
+    ketik di pemanggil tidak boleh berubah menjadi "hapus semua".
+    """
+    chunks = _ticket_id_chunks(ticket_ids)
+    if not chunks:
+        return 0
+    count = 0
+    for chunk in chunks:
+        for row in _results_by_ticket_ids_q(db, chunk).all():
+            db.delete(row)
+            count += 1
     if count:
         db.commit()
     return count
@@ -2536,25 +2591,87 @@ def list_reprocess_jobs(
 
 
 def running_reprocess_job(db: Session, scope: Optional[str] = None) -> Optional[ReprocessJob]:
-    """Job yang masih berjalan, kalau ada — dicari lewat status, bukan dengan
-    memeriksa N job terakhir, supaya job lama yang tersangkut tetap terlihat.
+    """Job yang benar-benar masih berjalan, kalau ada.
 
     ``scope`` menyaring jenis job: ``"campaign"`` untuk job massal saja (dipakai
     layar Reprocess All Ticket saat menyambung kembali job-nya), ``None`` untuk
     keduanya (dipakai pengaman sebelum menjalankan job massal baru).
+
+    Status ``running`` saja TIDAK cukup, dan itu pelajaran mahal: fungsi ini yang
+    menolak Reprocess All dengan 409 "masih ada job massal berjalan", jadi satu job
+    yang tersangkut memblokir menu itu selamanya — jebakan yang sama dengan yang
+    mengunci tombol Delete per ticket, hanya satu tingkat di atasnya.
+
+    Yang menentukan karena itu bukan kolom status job, melainkan apakah masih ada
+    ITEM yang benar-benar aktif di dalamnya — aturan yang sama persis dengan
+    penanda per-ticket (:func:`_reprocess_item_active_clause`). Dua keadaan langsung
+    ikut terurus olehnya:
+
+    * job yang itemnya tinggal ``pending`` tua — task Celery-nya tidak pernah
+      sampai ke worker;
+    * job yang SELURUH itemnya sudah selesai tetapi statusnya tidak pernah
+      berpindah, karena ``finish_reprocess_job_if_complete`` dipanggil worker dan
+      worker itu mati tepat sebelum item terakhir.
+
+    Keduanya tidak punya pekerjaan tersisa, jadi keduanya tidak boleh memblokir
+    apa pun.
     """
-    q = db.query(ReprocessJob).filter(ReprocessJob.status == "running")
+    q = (
+        db.query(ReprocessJob)
+        .filter(ReprocessJob.status == "running")
+        .filter(
+            db.query(ReprocessJobItem)
+            .filter(
+                ReprocessJobItem.job_id == ReprocessJob.id,
+                _reprocess_item_active_clause(),
+            )
+            .exists()
+        )
+    )
     if scope:
         q = q.filter(ReprocessJob.scope == scope)
     return q.order_by(desc(ReprocessJob.created_at)).first()
 
 
-# Status item yang berarti "tiket ini sedang direproses": belum dikerjakan atau
-# sedang dikerjakan, pada job yang masih berjalan. Dipakai BERSAMA oleh pengaman
-# 409 (`active_reprocess_item_for_ticket`) dan penanda tombol per halaman
-# (`active_reprocess_ticket_ids`) — dua definisi terpisah akan membuat tombol
-# Reprocess berbohong: enable padahal server menolak, atau sebaliknya.
-REPROCESS_ACTIVE_ITEM_STATUSES = ["pending", "processing"]
+# Sesudah sekian lama, item ``pending`` bukan lagi antrean melainkan sisa.
+#
+# Kejadiannya nyata (11 September 2026): dua job ``scope="ticket"`` dibuat pukul
+# 10:39, task Celery-nya tidak pernah sampai ke worker — antrean kosong, item tidak
+# pernah berpindah ke ``processing``, tidak ada jejaknya di log worker. Jobnya
+# tertinggal ``running``. Tidak ada timeout dan tidak ada reaper, jadi kedua tiket
+# itu ditandai "sedang direproses" SELAMANYA: tombol Reprocess mati, tombol Delete
+# mati, dan Delete All melewatinya. Layar pun tidak menyediakan jalan keluar —
+# tombol "Batalkan" hanya ada untuk job ``scope="campaign"``.
+#
+# Enam jam dipilih karena jauh di atas pekerjaan yang wajar (satu tiket ~4,5 menit,
+# job massal terbesar pun hitungan jam) namun jauh di bawah "tertinggal semalaman".
+# Ambang ini melepas yang tersangkut tanpa menyentuh antrean yang benar-benar
+# sedang menunggu gilirannya.
+REPROCESS_STALE_AFTER = timedelta(hours=6)
+
+
+def _reprocess_item_active_clause():
+    """Klausa SQL "item ini benar-benar sedang direproses".
+
+    SATU definisi, dipakai ``active_reprocess_item_for_ticket`` (pengaman 409) dan
+    ``active_reprocess_ticket_ids`` (penanda tombol + Delete All). Dua definisi
+    terpisah akan membuat tombolnya berbohong: enable padahal server menolak, atau
+    sebaliknya — dan sejak ada aturan umur, itu jauh lebih mudah terjadi.
+
+    ``processing`` sengaja TIDAK ikut kedaluwarsa berapa pun umurnya: statusnya
+    berarti seorang worker sudah memegang tiket itu dan mungkin sedang menunggu
+    jawaban LLM. Melepasnya berarti mengizinkan penghapusan row yang sebentar lagi
+    disentuh worker tersebut — bahaya yang justru ingin dicegah oleh seluruh
+    pemeriksaan ini. Item ``pending`` tidak membawa risiko itu: menurut definisinya
+    belum ada yang memegangnya.
+    """
+    return or_(
+        ReprocessJobItem.status == "processing",
+        and_(
+            ReprocessJobItem.status == "pending",
+            ReprocessJob.created_at >= datetime.now() - REPROCESS_STALE_AFTER,
+        ),
+    )
 
 
 def active_reprocess_item_for_ticket(db: Session, ticket_id: str) -> Optional[ReprocessJobItem]:
@@ -2573,7 +2690,7 @@ def active_reprocess_item_for_ticket(db: Session, ticket_id: str) -> Optional[Re
         .join(ReprocessJob, ReprocessJob.id == ReprocessJobItem.job_id)
         .filter(
             ReprocessJobItem.ticket_id == tid,
-            ReprocessJobItem.status.in_(REPROCESS_ACTIVE_ITEM_STATUSES),
+            _reprocess_item_active_clause(),
             ReprocessJob.status == "running",
         )
         .order_by(desc(ReprocessJobItem.id))
@@ -2606,7 +2723,7 @@ def active_reprocess_ticket_ids(db: Session, ticket_ids: list) -> set:
         .join(ReprocessJob, ReprocessJob.id == ReprocessJobItem.job_id)
         .filter(
             ReprocessJobItem.ticket_id.in_(tids),
-            ReprocessJobItem.status.in_(REPROCESS_ACTIVE_ITEM_STATUSES),
+            _reprocess_item_active_clause(),
             ReprocessJob.status == "running",
         )
         .distinct()
