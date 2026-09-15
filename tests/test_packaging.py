@@ -26,3 +26,14 @@ def test_spreadsheet_error_reason_ikut_ke_paket():
     ref = importlib.resources.files("qc_core.compliance")
     xlsx = [p.name for p in ref.iterdir() if p.name.endswith(".xlsx")]
     assert xlsx, "file .xlsx Error Reason tidak ikut ke dalam paket"
+
+
+def test_mus_exemption_json_ikut_ke_paket():
+    # Dibaca saat import oleh mus_exemption.py lewat os.path.dirname(__file__),
+    # persis seperti error_reasons.json — kalau tidak ikut, wheel-nya lolos build
+    # tapi gagal di-import saat runtime.
+    from qc_core.compliance import mus_exemption as mx
+
+    ref = importlib.resources.files("qc_core.compliance") / "mus_exemption.json"
+    assert ref.is_file()
+    assert mx.REGISTER, "daftar pengecualian Bank Mega kosong setelah di-install"
