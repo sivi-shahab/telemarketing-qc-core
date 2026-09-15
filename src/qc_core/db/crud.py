@@ -234,6 +234,20 @@ def result_json_map(db: Session, result_ids: list[str]) -> dict:
     return out
 
 
+def set_result_stage(db: Session, result_id: str, stage: str) -> None:
+    """Catat checkpoint pipeline TERAKHIR yang selesai (``_Tahap.catat`` di
+    worker/tasks/process_transcript.py), commit langsung supaya API bisa membaca
+    progres tiket ini SELAGI masih diproses (14 September 2026 — lihat
+    ``PROCESSING_STAGES`` di process_transcript.py untuk urutan & labelnya).
+
+    Sengaja TIDAK memanggil ``get_result``/raise bila baris tidak ada: ini
+    dipanggil di tengah pipeline murni untuk keperluan tampilan, jadi kegagalannya
+    tidak boleh pernah menggagalkan pemrosesan tiket itu sendiri — pemanggil
+    (``_Tahap.catat``) yang membungkusnya dengan try/except."""
+    db.query(Result).filter(Result.id == result_id).update({"current_stage": stage})
+    db.commit()
+
+
 def save_result_data(db: Session, result_id: str, result_json: dict) -> ResultData:
     data = ResultData(result_id=uuid.UUID(str(result_id)), result_json=result_json)
     db.add(data)
