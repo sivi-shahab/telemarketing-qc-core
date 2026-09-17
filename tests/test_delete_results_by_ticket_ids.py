@@ -40,3 +40,13 @@ def test_klausa_aktif_processing_tidak_pernah_kedaluwarsa():
     assert "created_at" not in str(processing)
     assert processing.right.value == "processing"
     assert "created_at" in str(pending_and_fresh)
+
+
+def test_klausa_aktif_processing_tidak_bergantung_status_job():
+    """Membatalkan job hanya melewati item ``pending``; item ``processing``-nya
+    tetap dikerjakan worker, jadi tiketnya harus tetap terhitung aktif walau job-nya
+    sudah ``cancelled``. ``pending`` hanya dihitung selagi job-nya ``running``."""
+    clause = crud._reprocess_item_active_clause()
+    processing, pending_and_fresh = clause.clauses
+    assert "reprocess_jobs.status" not in str(processing)
+    assert "reprocess_jobs.status" in str(pending_and_fresh)
