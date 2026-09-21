@@ -14,7 +14,7 @@ from qc_core.compliance.processing_stages import (
 
 def test_urutan_dan_kunci_stabil():
     assert STAGE_KEYS == (
-        "unduh_pdf", "baca_teks_pdf", "klasifikasi_llm", "rangkai_transkrip",
+        "unduh_pdf", "baca_teks_pdf", "cek_nama_agent", "rangkai_transkrip",
         "campaign_dan_acuan", "penilaian_llm", "gabung_dan_skor", "simpan_hasil",
         "tandai_selesai",
     )
@@ -29,11 +29,11 @@ def test_belum_ada_checkpoint_tahap_pertama_berjalan():
 
 
 def test_current_stage_adalah_yang_SUDAH_selesai():
-    rows = stage_table("klasifikasi_llm")
+    rows = stage_table("cek_nama_agent")
     by_key = {r["key"]: r["state"] for r in rows}
     assert by_key["unduh_pdf"] == "selesai"
     assert by_key["baca_teks_pdf"] == "selesai"
-    assert by_key["klasifikasi_llm"] == "selesai"
+    assert by_key["cek_nama_agent"] == "selesai"
     # yang berjalan adalah SATU SESUDAHNYA
     assert by_key["rangkai_transkrip"] == "berjalan"
     assert by_key["campaign_dan_acuan"] == "menunggu"

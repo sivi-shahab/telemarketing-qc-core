@@ -160,6 +160,42 @@ def test_evaluate_all_fail_raises_after_max_attempts():
 
 
 # --------------------------------------------------------------------------
+# evaluate — required_keys (guards against valid-JSON-but-missing-sections,
+# case seen on ticket 030226vUJS: reference data was complete but the LLM's
+# response silently dropped cashline/card-holder verification keys)
+# --------------------------------------------------------------------------
+
+def test_evaluate_missing_required_key_retries_then_succeeds():
+    llm = FakeLLM([
+        '{"scorecard_result": []}',
+        '{"scorecard_result": [], "cashline_data_verification": []}',
+    ])
+    out = E.evaluate(
+        "P", MESSAGES, "KB", "SC", llm, "m",
+        max_retries=2, required_keys=["cashline_data_verification"],
+    )
+    assert out == {"scorecard_result": [], "cashline_data_verification": []}
+    assert llm.chat.completions.calls == 2
+
+
+def test_evaluate_missing_required_key_raises_after_max_attempts():
+    llm = FakeLLM(['{"scorecard_result": []}'])
+    with pytest.raises(ValueError, match="cashline_data_verification"):
+        E.evaluate(
+            "P", MESSAGES, "KB", "SC", llm, "m",
+            max_retries=2, required_keys=["cashline_data_verification"],
+        )
+    assert llm.chat.completions.calls == 3
+
+
+def test_evaluate_no_required_keys_accepts_any_valid_json():
+    llm = FakeLLM(['{"scorecard_result": []}'])
+    out = E.evaluate("P", MESSAGES, "KB", "SC", llm, "m", required_keys=None)
+    assert out == {"scorecard_result": []}
+    assert llm.chat.completions.calls == 1
+
+
+# --------------------------------------------------------------------------
 # evaluate — raw text embedding (no json.dumps wrapping)
 # --------------------------------------------------------------------------
 

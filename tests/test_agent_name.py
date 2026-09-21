@@ -1,17 +1,16 @@
 """Nama on-air wajib dipakai saat perkenalan (7 September 2026, konfirmasi Bank Mega).
 
-SC_CL_2 tidak lagi cukup dipenuhi dengan memperkenalkan diri: nama yang disebut harus
-sesuai kolom NAME ONLINE roster. Ditegakkan di kode karena LLM tidak pernah melihat
-roster — NAME ONLINE hanya ada di database sales.
+``agent_name_verdict()`` diuji di sini bukan lagi untuk menimpa skor SC_CL_2 — sejak
+18 September 2026 (tiket 020455CL3A) itemnya dinilai LLM sepenuhnya, dibantu blok
+referensi NAME ONLINE di prompt (``apply_agent_name_verdict`` dihapus). Fungsi ini
+tetap dipakai untuk info diagnostik (``agent_name_check``) dan oleh
+``filter_calls_by_agent`` (kepemilikan panggilan) — jadi akurasinya tetap penting.
 
 Yang dijaga tes ini adalah dua arah kesalahan yang sama mahalnya: menjatuhkan agent yang
 sebenarnya menyebut namanya (detektor jangkar terbukti meleset di 37 dari 111 rekaman
 seed 7 September), dan meloloskan yang memakai nama asli atau nama orang lain.
 """
-from qc_core.compliance.call_ownership import (
-    agent_name_verdict,
-    apply_agent_name_verdict,
-)
+from qc_core.compliance.call_ownership import agent_name_verdict
 
 ROSTER = ("ANDINI", "AUREL", "NISA", "IKA", "RAIZEL", "VADLI")
 
@@ -95,6 +94,30 @@ def test_nama_pendek_tidak_dicocokkan_fuzzy():
     assert v["match"] is False
 
 
+def test_vokatif_sisipan_sebelum_dari_tidak_menyembunyikan_nama():
+    """Tiket 020455CL3A: "...saya Eveline, Ibu dari Bank Mega..." — vokatif "Ibu"
+    tersisip ANTARA nama dan "dari" dulu membuat pemangkasan mundur berhenti di "Ibu"
+    (stopword) sebelum sampai ke "Eveline", sehingga detected=[] padahal nama jelas
+    terucap. "Eveline" tidak cocok NAME ONLINE "LINA" manapun di roster."""
+    v = agent_name_verdict(
+        _teks("Baik. Ibu, ee, izin saya Eveline, Ibu dari Bank Mega Jakarta, "
+              "izin minta waktunya sebentar boleh Ibu?"),
+        "LINA", ROSTER)
+    assert "Eveline" in v["detected"]
+    assert v["match"] is False
+
+
+def test_disfluensi_dari_dari_tidak_tertangkap_sebagai_nama():
+    """Tiket 020455CL3A (kalimat lain di panggilan yang sama): disfluensi ASR
+    "...fasilitas dari, dari Bank Mega..." dulu membuat kata "dari" itu sendiri
+    tertangkap sebagai kandidat nama (persis kata kunci jangkarnya sendiri)."""
+    v = agent_name_verdict(
+        _teks("Bapak bisa menikmati fasilitas dari, dari Bank Mega untuk kebutuhan "
+              "finansial."),
+        "LINA", ROSTER)
+    assert "dari" not in v["detected"]
+
+
 # --------------------------------------------------------------------------
 # Tidak dinilai
 # --------------------------------------------------------------------------
@@ -102,33 +125,3 @@ def test_nama_pendek_tidak_dicocokkan_fuzzy():
 def test_agent_tidak_ada_di_roster_tidak_dihukum():
     v = agent_name_verdict(_teks("saya Rina dari Bank Mega"), "", ROSTER)
     assert v["match"] is None
-
-
-# --------------------------------------------------------------------------
-# Penerapan ke scorecard
-# --------------------------------------------------------------------------
-
-def _ev(status="SESUAI"):
-    return {"scorecard_result": [
-        {"item_code": "SC_CL_1", "status": "SESUAI", "item_score": 2},
-        {"item_code": "SC_CL_2", "status": status, "item_score": 3, "reason": "asli"},
-    ]}
-
-
-def test_sc_cl_2_diturunkan_dengan_alasannya():
-    out = apply_agent_name_verdict(_ev(), {"match": False, "reason": "sebab X"})
-    r = out["scorecard_result"][1]
-    assert r["status"] == "BELUM_SESUAI" and r["item_score"] == 0
-    assert r["reason"] == "sebab X"
-    assert out["scorecard_result"][0]["status"] == "SESUAI"   # item lain tak tersentuh
-
-
-def test_verdict_cocok_tidak_pernah_menaikkan():
-    """LLM bisa menjatuhkan SC_CL_2 karena sebab lain; itu tidak boleh ditimpa."""
-    ev = _ev("BELUM_SESUAI")
-    assert apply_agent_name_verdict(ev, {"match": True}) is ev
-
-
-def test_tanpa_roster_tidak_mengubah_apa_pun():
-    ev = _ev()
-    assert apply_agent_name_verdict(ev, {"match": None}) is ev

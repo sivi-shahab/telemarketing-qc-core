@@ -86,8 +86,8 @@ def test_pending_diperlakukan_sama_dengan_exempt():
 def test_not_exempt_setelah_gerbang_memotong_skor_seperti_biasa():
     ev = _eval({"status": "NOT_EXEMPT", "kategori": "SAKIT", "disease_listed": False})
     assert scoring.mus_wajib_tidak_dipenuhi(ev) is True
-    assert scoring.max_score(ev) == 135.5
-    assert scoring.scorecard_score(ev) == 135.5 - 10.5  # 2 item TIDAK_DINILAI dipotong penuh
+    assert scoring.max_score(ev) == 136.75
+    assert scoring.scorecard_score(ev) == 136.75 - 10.5  # 2 item TIDAK_DINILAI dipotong penuh
 
 
 # --- documents.mus_exception_doc_requirements / doc_confirmed ---------------
