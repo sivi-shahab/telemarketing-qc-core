@@ -458,3 +458,60 @@ def test_wajib_ulang_perbaikan_tidak_menilai_item_dipertahankan():
     out, _, _ = pp.merge_parallel([utama, perbaikan], ["u.pdf", "p.pdf"], [TS[0], TS[1]], 0)
     baris = {r["item_code"]: r for r in out["scorecard_result"]}
     assert baris["SC_CL_27"]["evidence"] == {"quote": "utama"}
+
+
+# --------------------------------------------------------------------------
+# map_concurrently — panggilan LLM per rekaman berjalan BERSAMAAN (21 Sept 2026)
+# --------------------------------------------------------------------------
+
+def test_map_concurrently_benar_benar_bersamaan():
+    """Tiga pekerjaan 0.3 dtk: berurutan >= 0.9 dtk, bersamaan ~0.3 dtk."""
+    import time
+    t0 = time.monotonic()
+    out = pp.map_concurrently(lambda x: (time.sleep(0.3), x * 2)[1], [1, 2, 3], max_workers=3)
+    assert out == [2, 4, 6]
+    assert time.monotonic() - t0 < 0.7
+
+
+def test_map_concurrently_urutan_hasil_mengikuti_input_bukan_urutan_selesai():
+    """Item pertama paling lambat, tetapi tetap di indeks 0 — merge_parallel menjajarkan
+    hasilnya dengan daftar berkas dan indeks rekaman utama."""
+    import time
+    out = pp.map_concurrently(lambda x: (time.sleep(0.3 if x == "a" else 0.0), x)[1],
+                              ["a", "b", "c"], max_workers=3)
+    assert out == ["a", "b", "c"]
+
+
+def test_map_concurrently_kegagalan_diteruskan():
+    import pytest
+
+    def fn(x):
+        if x == 2:
+            raise RuntimeError("LLM gagal")
+        return x
+    with pytest.raises(RuntimeError, match="LLM gagal"):
+        pp.map_concurrently(fn, [1, 2, 3], max_workers=3)
+
+
+def test_map_concurrently_satu_item_atau_satu_worker_berurutan():
+    import threading
+    ids = []
+    pp.map_concurrently(lambda x: ids.append(threading.get_ident()), [1, 2, 3], max_workers=1)
+    assert len(set(ids)) == 1                      # semua di thread pemanggil
+    assert pp.map_concurrently(lambda x: x, [7], max_workers=4) == [7]
+    assert pp.map_concurrently(lambda x: x, [], max_workers=4) == []
+
+
+def test_map_concurrently_batas_worker_dihormati():
+    import threading, time
+    aktif, puncak, lock = 0, 0, threading.Lock()
+
+    def fn(_):
+        nonlocal aktif, puncak
+        with lock:
+            aktif += 1; puncak = max(puncak, aktif)
+        time.sleep(0.1)
+        with lock:
+            aktif -= 1
+    pp.map_concurrently(fn, range(6), max_workers=2)
+    assert puncak == 2
