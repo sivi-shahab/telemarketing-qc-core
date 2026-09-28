@@ -7,6 +7,10 @@ Postgres produksi memakai ``TimeZone = Asia/Jakarta``, jadi kolom
 
 - tenggat reproses "tersangkut" 6 jam efektif menjadi 13 jam;
 - tiket kekurangan dokumen baru jatuh FAIL (H+2) 7 jam terlambat.
+
+Sejak migrasi 0060 kolom DB disimpan UTC (sesi dipaksa ``timezone=UTC``), jadi batas
+reproses kembali UTC. ``submit_time`` TMS tetap WIB dari hulunya, jadi tenggat H+2
+tetap memakai ``crud.now_wib()``.
 """
 import inspect
 import os
@@ -64,10 +68,13 @@ def test_statistik_tidak_memakai_jam_container_untuk_tenggat():
     assert "datetime.now()" not in inspect.getsource(stats_aggregate)
 
 
-def test_batas_reproses_tersangkut_dihitung_dari_jam_wib(container_utc):
+def test_batas_reproses_tersangkut_dihitung_dari_jam_utc(container_utc):
+    """``reprocess_jobs.created_at`` disimpan UTC (sesi DB dipaksa timezone=UTC sejak
+    migrasi 0060), jadi batasnya UTC — bukan WIB seperti ``submit_time`` TMS."""
     clause = crud._reprocess_item_active_clause()
     _processing, pending_and_fresh = clause.clauses
     (created_cmp,) = [c for c in pending_and_fresh.clauses if "created_at" in str(c)]
     batas = created_cmp.right.value
+    utc_sekarang = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    assert abs(batas - (_wib_sekarang() - crud.REPROCESS_STALE_AFTER)) < timedelta(seconds=5)
+    assert abs(batas - (utc_sekarang - crud.REPROCESS_STALE_AFTER)) < timedelta(seconds=5)
