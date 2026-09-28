@@ -24,6 +24,9 @@ dependencies = [
     # PDF). Dependensi langsung tidak boleh bergantung pada dependensi transitif
     # paket lain -- pdfplumber boleh saja melepasnya suatu saat.
     "pillow>=10",
+    # Cache DWH bersama (L2) di services/data_dwh.py. Sebelumnya hanya transitif
+    # lewat celery[redis] di image api/worker.
+    "redis>=5",
 ]
 
 [project.optional-dependencies]
