@@ -2,32 +2,32 @@
 
 Rekaman valid = nasabah tertarik Mega Cashline DAN Mega Ultima Shield. Cashline saja
 TIDAK valid kecuali ada pengecualian. Konsekuensinya pada angka: skor maksimal tetap
-136.75 (bukan turun ke 100), 12 item MUS dipotong, sehingga tiket semacam itu mentok
-di 100/136.75 = 73,1% — di bawah batas lulus 123.08.
+150 (bukan turun ke 100), 12 item MUS dipotong, sehingga tiket semacam itu mentok
+di 100/150 = 66,7% — di bawah batas lulus 135.0.
 
-Bobot di bawah memakai ``Score Card Cashline 18092026.xlsx``: Mega Ultima Shield
-35.5->36.75 karena SATU item baru, ``SC_CL_43`` (premi tidak dapat dikembalikan bila
-customer membatalkan, bobot 1.25) di kategori Final Konfirmasi Mega Ultima Shield.
-Revisi sebelumnya (v4, 14 September 2026) menurunkan Mega Cashline 108.75->100 dan
-MUS 41.25->35.5.
+Bobot di bawah memakai ``Score Card Cashline 25092026.xlsx``: Bank Mega memisahkan
+MUS pada Kartu Kredit (MUS CC) menjadi campaign tersendiri, sehingga 4 kategori MUS
+CC dihapus dari scorecard Cashline dan bobotnya (13.25) dilebur ke item-item MUS
+dasar, menaikkan Mega Ultima Shield 36.75->50 (SC_CL_21 3->4.5, SC_CL_33 2.25->3.25,
+SC_CL_34 2.25->3.5, SC_CL_43 1.25->3.25, SC_CL_38 7.5->15).
 """
 from qc_core.compliance import mus_exemption as mx
 from qc_core.compliance import scoring
 
-# 12 item MUS beserta bobotnya dari Score Card Cashline 18092026; totalnya tepat 36.75.
+# 12 item MUS beserta bobotnya dari Score Card Cashline 25092026; totalnya tepat 50.
 MUS_ITEMS = [
     ("SC_CL_17", 3, "Penjelasan Mega Ultima Shield"),
     ("SC_CL_18", 3, "Penjelasan Mega Ultima Shield"),
     ("SC_CL_19", 3, "Penjelasan Mega Ultima Shield"),
     ("SC_CL_20", 3, "Penjelasan Mega Ultima Shield"),
-    ("SC_CL_21", 3, "Penjelasan Mega Ultima Shield"),
+    ("SC_CL_21", 4.5, "Penjelasan Mega Ultima Shield"),
     ("SC_CL_22", 4, "Penjelasan Mega Ultima Shield"),
-    ("SC_CL_33", 2.25, "Final Konfirmasi Mega Ultima Shield"),
-    ("SC_CL_34", 2.25, "Final Konfirmasi Mega Ultima Shield"),
+    ("SC_CL_33", 3.25, "Final Konfirmasi Mega Ultima Shield"),
+    ("SC_CL_34", 3.5, "Final Konfirmasi Mega Ultima Shield"),
     ("SC_CL_35", 2.25, "Final Konfirmasi Mega Ultima Shield"),
     ("SC_CL_36", 2.25, "Final Konfirmasi Mega Ultima Shield"),
-    ("SC_CL_43", 1.25, "Final Konfirmasi Mega Ultima Shield"),
-    ("SC_CL_38", 7.5, "Legal Statement Mega Ultima Shield"),
+    ("SC_CL_43", 3.25, "Final Konfirmasi Mega Ultima Shield"),
+    ("SC_CL_38", 15, "Legal Statement Mega Ultima Shield"),
 ]
 
 
@@ -46,8 +46,8 @@ def _eval(mus_status, *, mus_item_status="TIDAK_DINILAI", exemption=None, cashli
     return ev
 
 
-def test_bobot_mus_berjumlah_36_75():
-    assert sum(w for _, w, _ in MUS_ITEMS) == 36.75
+def test_bobot_mus_berjumlah_50():
+    assert sum(w for _, w, _ in MUS_ITEMS) == 50
 
 
 # --- predikat inti ---------------------------------------------------------
@@ -86,9 +86,9 @@ def test_tanpa_minat_cashline_bukan_urusan_aturan_ini():
 
 # --- dampak ke angka -------------------------------------------------------
 
-def test_skor_maksimal_tetap_135_5_saat_mus_wajib():
-    assert scoring.max_score(_eval("NOT_INTERESTED")) == 136.75
-    assert scoring.passing_grade(_eval("NOT_INTERESTED")) == 123.08
+def test_skor_maksimal_tetap_150_saat_mus_wajib():
+    assert scoring.max_score(_eval("NOT_INTERESTED")) == 150
+    assert scoring.passing_grade(_eval("NOT_INTERESTED")) == 135.0
 
 
 def test_skor_maksimal_turun_saat_dikecualikan():
@@ -98,8 +98,8 @@ def test_skor_maksimal_turun_saat_dikecualikan():
 
 
 def test_item_mus_tidak_dinilai_dipotong_penuh():
-    """Tanpa potongan ini skor maksimal naik ke 136.75 sementara 12 item MUS tidak
-    dipotong apa pun — tiket cashline-saja justru dapat 36.75 poin gratis."""
+    """Tanpa potongan ini skor maksimal naik ke 150 sementara 12 item MUS tidak
+    dipotong apa pun — tiket cashline-saja justru dapat 50 poin gratis."""
     ev = _eval("NOT_INTERESTED")
     assert scoring.scorecard_score(ev) == 100
     assert scoring.base_ai_status(ev) == "FAIL"
@@ -110,15 +110,15 @@ def test_item_mus_sesuai_tetap_dihargai():
     dihargai, tidak ikut dihanguskan.
 
     Kasus ekstrem ini sengaja diuji untuk menegaskan bahwa aturan MUS bekerja lewat
-    ARITMETIKA, bukan veto — bila seluruh 11 item MUS bernilai SESUAI, tiketnya
+    ARITMETIKA, bukan veto — bila seluruh 12 item MUS bernilai SESUAI, tiketnya
     memang lulus. Di lapangan susunan itu tidak bisa terjadi: SC_CL_38 "Legal
     Statement Mega Ultima Shield" baru SESUAI bila nasabah menyatakan setuju, yang
     dengan sendirinya membuat mus_interest = INTERESTED. Yang realistis adalah
-    penjelasan SESUAI tetapi Final Konfirmasi (9) + Legal Statement (7.5) gagal,
-    yakni 136.75 - 16.5 = 120.25 — masih di bawah batas lulus 123.08.
+    penjelasan SESUAI tetapi Final Konfirmasi (14.5) + Legal Statement (15) gagal,
+    yakni 150 - 29.5 = 120.5 — masih di bawah batas lulus 135.0.
     """
     ev = _eval("NOT_INTERESTED", mus_item_status="SESUAI")
-    assert scoring.scorecard_score(ev) == 136.75
+    assert scoring.scorecard_score(ev) == 150
     assert scoring.base_ai_status(ev) == "PASS"
 
 
@@ -129,14 +129,14 @@ def test_penolakan_realistis_tetap_tidak_lulus():
     for it in ev["scorecard_result"]:
         if it["category"] != "Penjelasan Mega Ultima Shield":
             it["status"] = "BELUM_SESUAI"
-    assert scoring.scorecard_score(ev) == 119
-    assert scoring.passing_grade(ev) == 123.08
+    assert scoring.scorecard_score(ev) == 120.5
+    assert scoring.passing_grade(ev) == 135.0
     assert scoring.base_ai_status(ev) == "FAIL"
 
 
 def test_belum_sesuai_tidak_dipotong_dua_kali():
     ev = _eval("NOT_INTERESTED", mus_item_status="BELUM_SESUAI")
-    assert scoring.scorecard_score(ev) == 136.75 - 36.75
+    assert scoring.scorecard_score(ev) == 150 - 50
 
 
 def test_dikecualikan_memakai_perhitungan_lama():

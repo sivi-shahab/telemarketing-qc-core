@@ -37,3 +37,11 @@ def test_mus_exemption_json_ikut_ke_paket():
     ref = importlib.resources.files("qc_core.compliance") / "mus_exemption.json"
     assert ref.is_file()
     assert mx.REGISTER, "daftar pengecualian Bank Mega kosong setelah di-install"
+
+
+def test_logo_ppt_error_rate_ikut_ke_paket():
+    # Dibaca ppt_error_rate.py lewat Path(__file__).parent / "assets" saat deck
+    # dibuat — tanpa package-data "assets/*.png" wheel-nya lolos build tapi
+    # Generate PPT Error Rate gagal di runtime.
+    ref = importlib.resources.files("qc_core.compliance") / "assets" / "bank-mega-logo.png"
+    assert ref.is_file()

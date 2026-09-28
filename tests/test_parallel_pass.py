@@ -515,3 +515,46 @@ def test_map_concurrently_batas_worker_dihormati():
             aktif -= 1
     pp.map_concurrently(fn, range(6), max_workers=2)
     assert puncak == 2
+
+
+# --------------------------------------------------------------------------
+# SC_CL_43 (Final Konfirmasi Mega Ultima Shield, 18 Sept 2026) di merge multi-rekaman.
+# Aturan wajib-ulang berbasis NAMA KATEGORI, jadi item baru di kategori itu ikut
+# otomatis — tes ini menjaga agar tetap begitu.
+# --------------------------------------------------------------------------
+
+def _mus(code, cat, status, tag):
+    return {"item_code": code, "category": cat, "status": status, "weight": 1,
+            "reason": f"{code} {tag}", "evidence": {"ticket_id": f"{tag}_x", "quote": tag}}
+
+
+_PENJ, _FK = "Penjelasan Mega Ultima Shield", "Final Konfirmasi Mega Ultima Shield"
+
+
+def _merge_mus(utama, perbaikan):
+    out, rincian, _ = pp.merge_parallel(
+        [{"scorecard_result": utama}, {"scorecard_result": perbaikan}],
+        ["u.pdf", "p.pdf"], TS[:2], 0)
+    return {r["item_code"]: r for r in out["scorecard_result"]}, rincian
+
+
+def test_sc_cl_43_gagal_di_utama_diselamatkan_perbaikan():
+    b, _ = _merge_mus([_mus("SC_CL_43", _FK, "BELUM_SESUAI", "U")],
+                      [_mus("SC_CL_43", _FK, "SESUAI", "P")])
+    assert b["SC_CL_43"]["status"] == "SESUAI" and b["SC_CL_43"]["pass2"] is True
+
+
+def test_sc_cl_43_ikut_wajib_ulang_bila_penjelasan_mus_gagal():
+    b, rincian = _merge_mus(
+        [_mus("SC_CL_17", _PENJ, "BELUM_SESUAI", "U"), _mus("SC_CL_43", _FK, "SESUAI", "U")],
+        [_mus("SC_CL_17", _PENJ, "SESUAI", "P"), _mus("SC_CL_43", _FK, "BELUM_SESUAI", "P")])
+    # diganti UTUH dengan versi perbaikan, termasuk yang sudah SESUAI di utama
+    assert b["SC_CL_43"]["status"] == "BELUM_SESUAI" and b["SC_CL_43"]["reason"] == "SC_CL_43 P"
+    assert any(r["item_code"] == "SC_CL_43" and r.get("alasan") for r in rincian)
+
+
+def test_sc_cl_43_sesuai_di_utama_tidak_ditimpa_tanpa_pemicu():
+    b, _ = _merge_mus(
+        [_mus("SC_CL_17", _PENJ, "SESUAI", "U"), _mus("SC_CL_43", _FK, "SESUAI", "U")],
+        [_mus("SC_CL_17", _PENJ, "SESUAI", "P"), _mus("SC_CL_43", _FK, "BELUM_SESUAI", "P")])
+    assert b["SC_CL_43"]["reason"] == "SC_CL_43 U"
