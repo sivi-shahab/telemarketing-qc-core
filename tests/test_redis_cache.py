@@ -75,3 +75,39 @@ def test_redis_mati_mengembalikan_kosong_dan_berhenti_mencoba(monkeypatch):
     redis_cache.set_many({"a": "1"})          # tidak melempar
     assert len(calls) == 1                    # sesudah gagal, jeda — tidak dicoba lagi
     redis_cache.reset()
+
+
+class FakeLockRedis(FakeRedis):
+    def set(self, key, value, ex=None, nx=False):
+        if self.fail:
+            raise ConnectionError("redis mati")
+        if nx and key in self.store:
+            return None
+        self.store[key], self.ttl[key] = value, ex
+        return True
+
+    def delete(self, key):
+        self.store.pop(key, None)
+
+
+def test_kunci_hanya_didapat_sekali_sampai_dilepas(monkeypatch):
+    r = FakeLockRedis()
+    monkeypatch.setattr(redis_cache, "_client", lambda: r)
+    redis_cache.reset()
+
+    assert redis_cache.acquire("lock:a", ttl_sec=60) is True
+    assert r.ttl["lock:a"] == 60
+    assert redis_cache.acquire("lock:a", ttl_sec=60) is False
+    redis_cache.release("lock:a")
+    assert redis_cache.acquire("lock:a", ttl_sec=60) is True
+
+
+def test_kunci_tanpa_redis_tetap_boleh_jalan(monkeypatch):
+    """Redis mati/tidak dikonfigurasi: jangan memblokir pekerjaan (fail-open) —
+    dobel hitung lebih baik daripada snapshot tidak pernah diperbarui."""
+    monkeypatch.setattr(redis_cache, "_client", lambda: FakeLockRedis(fail=True))
+    redis_cache.reset()
+    assert redis_cache.acquire("lock:b", ttl_sec=60) is True
+    redis_cache.reset()
+    monkeypatch.setattr(redis_cache, "_client", lambda: None)
+    assert redis_cache.acquire("lock:c", ttl_sec=60) is True
