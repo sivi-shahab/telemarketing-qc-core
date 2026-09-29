@@ -45,3 +45,17 @@ def test_logo_ppt_error_rate_ikut_ke_paket():
     # Generate PPT Error Rate gagal di runtime.
     ref = importlib.resources.files("qc_core.compliance") / "assets" / "bank-mega-logo.png"
     assert ref.is_file()
+
+
+def test_raster_template_ppt_error_rate_ikut_ke_paket():
+    # Background/cover deck (ppt_error_rate._ASSET_DIR / "*.jpg") — butuh
+    # package-data "assets/*.jpg"; tanpa itu deck gagal dibuat di runtime.
+    from qc_core.compliance import ppt_error_rate as ppt
+
+    paths = [
+        ppt._TPL_COVER, ppt._TPL_DIVIDER_TREND, ppt._TPL_DIVIDER_RETURN,
+        ppt._TPL_THANKYOU, ppt._TPL_TREND, ppt._TPL_AM, ppt._TPL_SPV,
+        ppt._TPL_DETAIL, *ppt._TPL_TOPTLO.values(),
+    ]
+    missing = [p.name for p in paths if not p.is_file()]
+    assert not missing, f"aset .jpg tidak ikut ke paket: {missing}"
