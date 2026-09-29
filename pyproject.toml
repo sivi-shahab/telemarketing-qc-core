@@ -41,8 +41,9 @@ where = ["src"]
 # WAJIB. error_reasons.json dibaca saat import oleh compliance/error_reasons.py
 # lewat os.path.dirname(__file__); tanpa baris ini wheel-nya lolos build tapi
 # gagal di-import saat runtime.
-# assets/bank-mega-logo.png dibaca ppt_error_rate.py lewat __file__ juga.
-"qc_core.compliance" = ["*.json", "*.xlsx", "assets/*.png"]
+# assets/*.png (logo) dan assets/*.jpg (raster template deck) dibaca
+# ppt_error_rate.py lewat __file__ juga.
+"qc_core.compliance" = ["*.json", "*.xlsx", "assets/*.png", "assets/*.jpg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
