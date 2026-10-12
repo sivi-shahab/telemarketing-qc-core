@@ -9,6 +9,16 @@ Aturan itu tidak terlihat dari tanda tangan fungsinya dan tidak ada test yang
 menjaganya di repo asal, jadi dikunci di sini.
 """
 from qc_core.db import crud
+from qc_core.db.models import QcAssignment, QcAssignmentEvent
+
+
+def _assigned(db):
+    """Baris ``QcAssignment`` saja — ``db.added`` juga memuat event audit-nya."""
+    return [o for o in db.added if isinstance(o, QcAssignment)]
+
+
+def _events(db):
+    return [o for o in db.added if isinstance(o, QcAssignmentEvent)]
 
 
 class _FakeQuery:
@@ -41,21 +51,27 @@ def test_tiket_yang_sudah_dibagi_dilewati_bukan_ditimpa():
     db = _FakeDb(sudah_terbagi=["T-1"])
     n = crud.bulk_assign_tickets_to_qc(db, [("T-1", "qc-b"), ("T-2", "qc-b")])
     assert n == 1
-    assert [a.ticket_id for a in db.added] == ["T-2"]
-    assert all(a.qc_username != "qc-b" or a.ticket_id == "T-2" for a in db.added)
+    assert [a.ticket_id for a in _assigned(db)] == ["T-2"]
+    assert all(a.qc_username != "qc-b" or a.ticket_id == "T-2" for a in _assigned(db))
+    # Tiket yang dilewati juga tidak punya event.
+    assert [e.ticket_id for e in _events(db)] == ["T-2"]
 
 
 def test_satu_commit_untuk_seluruh_batch():
     db = _FakeDb()
     crud.bulk_assign_tickets_to_qc(db, [("T-1", "a"), ("T-2", "b"), ("T-3", "c")])
-    assert len(db.added) == 3
+    assert len(_assigned(db)) == 3
+    # Event audit (qc_assignment_events) ikut di commit yang sama.
+    assert [(e.ticket_id, e.action, e.source) for e in _events(db)] == [
+        ("T-1", "assign", "auto"), ("T-2", "assign", "auto"), ("T-3", "assign", "auto"),
+    ]
     assert db.commits == 1, "Auto Assign harus satu commit, bukan commit per tiket"
 
 
 def test_tiket_kembar_dalam_satu_batch_hanya_sekali():
     db = _FakeDb()
     n = crud.bulk_assign_tickets_to_qc(db, [("T-1", "a"), ("T-1", "b")])
-    assert n == 1 and len(db.added) == 1
+    assert n == 1 and len(_assigned(db)) == 1
 
 
 def test_pasangan_kosong_dan_spasi_dibuang():
