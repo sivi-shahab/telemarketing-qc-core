@@ -33,10 +33,12 @@ def _stub_ai(monkeypatch, verdicts, human=None):
 
     def fake_qc(db, ids):
         out = {}
-        for rid, (status, tl) in (human or {}).items():
+        for rid, spec in (human or {}).items():
+            status, tl, decided = (*spec, None)[:3]
             if str(rid) in ids:
                 out[str(rid)] = SimpleNamespace(
-                    requested_status=status, tl_qc_status=tl, approval_status="pending")
+                    requested_status=status, tl_qc_status=tl, approval_status="pending",
+                    requested_at=None, tl_qc_reviewed_at=decided, reviewed_at=None)
         return out
 
     monkeypatch.setattr(sa, "ai_status_map", fake)
@@ -83,6 +85,16 @@ def test_vonis_human_terbaru_bila_lebih_dari_satu(monkeypatch):
     assert sa.one_result_per_ticket(None, [old, new, fail]) == [new]
 
 
+def test_vonis_yang_diputus_paling_akhir_menang(monkeypatch):
+    """QC mengubah vonis lewat baris clone yang LEBIH LAMA: keputusan terakhir yang
+    berlaku, bukan baris yang paling baru di-upload."""
+    old, new = _row("A", hours=0), _row("A", hours=2)
+    _stub_ai(monkeypatch, {old.id: "FAIL", new.id: "PASS"},
+             human={old.id: ("FAIL", "approved", T0 + timedelta(days=2)),
+                    new.id: ("PASS", "approved", T0 + timedelta(days=1))})
+    assert sa.one_result_per_ticket(None, [old, new]) == [old]
+
+
 def test_usulan_belum_final_tidak_mengalahkan_return(monkeypatch):
     voted, fail = _row("A", hours=0), _row("A", hours=2)
     _stub_ai(monkeypatch, {voted.id: "PASS", fail.id: "FAIL"},
@@ -121,3 +133,58 @@ def test_status_per_ticket_done_menang_lalu_terbaru():
     ]
     assert crud.status_per_ticket(rows) == {"A": "done", "B": "pending"}
 
+
+
+# --- Menu Results: clone JOB-3 ikut menampilkan vonis tiketnya (19 Oktober 2026) ---
+
+def _stub_siblings(monkeypatch, rows):
+    def fake(db, tids):
+        return [r for r in rows if r.status == "done" and sa._customer_id(r.source_files) in set(tids)]
+
+    monkeypatch.setattr(crud, "done_results_by_ticket_ids", fake)
+
+
+def test_clone_mewarisi_vonis_final_tiketnya(monkeypatch):
+    voted, clone = _row("A", hours=0), _row("A", hours=3)
+    other = _row("B")
+    _stub_ai(monkeypatch, {}, human={voted.id: ("PASS", "approved")})
+    _stub_siblings(monkeypatch, [voted, clone, other])
+    out = sa.ticket_qc_requests(None, [clone, other])
+    assert out[str(clone.id)].requested_status == "PASS"
+    assert str(other.id) not in out
+
+
+def test_clone_tidak_mewarisi_usulan_yang_belum_final(monkeypatch):
+    voted, clone = _row("A", hours=0), _row("A", hours=3)
+    _stub_ai(monkeypatch, {}, human={voted.id: ("PASS", "pending")})
+    _stub_siblings(monkeypatch, [voted, clone])
+    assert sa.ticket_qc_requests(None, [clone]) == {}
+
+
+def test_baris_dengan_recording_baru_tidak_mewarisi(monkeypatch):
+    """Recording yang belum pernah dilihat human tidak ikut divonis."""
+    voted = _row("A", hours=0, files=["A_1.pdf"])
+    newer = _row("A", hours=3, files=["A_1.pdf", "A_2.pdf"])
+    _stub_ai(monkeypatch, {}, human={voted.id: ("PASS", "approved")})
+    _stub_siblings(monkeypatch, [voted, newer])
+    out = sa.ticket_qc_requests(None, [voted, newer])
+    assert str(newer.id) not in out
+    assert out[str(voted.id)].requested_status == "PASS"
+
+
+def test_semua_baris_ikut_keputusan_terakhir(monkeypatch):
+    a, b, c = _row("A", hours=0), _row("A", hours=1), _row("A", hours=2)
+    _stub_ai(monkeypatch, {},
+             human={a.id: ("FAIL", "approved", T0 + timedelta(days=1)),
+                    b.id: ("PASS", "approved", T0 + timedelta(days=2))})
+    _stub_siblings(monkeypatch, [a, b, c])
+    out = sa.ticket_qc_requests(None, [a, b, c])
+    assert {k: v.requested_status for k, v in out.items()} == {
+        str(a.id): "PASS", str(b.id): "PASS", str(c.id): "PASS"}
+
+
+def test_baris_belum_done_tidak_mewarisi(monkeypatch):
+    voted, pend = _row("A", hours=0), _row("A", "pending", hours=3)
+    _stub_ai(monkeypatch, {}, human={voted.id: ("PASS", "approved")})
+    _stub_siblings(monkeypatch, [voted, pend])
+    assert str(pend.id) not in sa.ticket_qc_requests(None, [pend])
