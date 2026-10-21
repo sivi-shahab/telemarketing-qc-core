@@ -82,7 +82,7 @@ def test_tanpa_flag_perilaku_lama_satu_panggilan(dwh):
 
 def test_key_ada_walau_null_tidak_memicu_fallback(dwh, monkeypatch):
     data_dwh.set_fill_cashline_ids(True)
-    lengkap = {"cashline": {"agent_id": None, "submit_time": None}, "customer": None}
+    lengkap = {"cashline": {"agent_id": None, "submit_time": None}, "customer": {"x": 1}}
     calls = []
 
     def fake_get(url, timeout=None):
