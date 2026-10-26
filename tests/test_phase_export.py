@@ -26,7 +26,8 @@ def _item(code, cat, status, **kw):
 
 
 def _tiket(items, ai="FAIL", cid="T1"):
-    return (SimpleNamespace(campaign="cashline"), cid, {"scorecard_result": items}, ai)
+    return (SimpleNamespace(campaign="cashline"), cid, {"scorecard_result": items}, ai,
+            "2026-09-02 14:05:27")
 
 
 def _jalankan(tikets, fase):
