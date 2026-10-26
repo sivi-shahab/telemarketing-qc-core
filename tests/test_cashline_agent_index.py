@@ -110,6 +110,23 @@ def test_fallback_runs_only_for_rows_missing_agent_id(monkeypatch):
     assert index["noAgent"]["agent_id"] == "recovered801"
 
 
+def test_dwh_only_fills_gaps_never_erases_snapshot_submit_time(monkeypatch):
+    """26 Okt 2026: snapshot tanpa agent_id tapi ber-submit_time. DWH yang kosong
+    (atau submit_time-nya lain) tidak boleh menimpa submit_time snapshot — filter
+    tanggal Results (SQL) membaca snapshot, jadi Statistics & export harus sama."""
+    monkeypatch.setattr(crud, "_cashline_ids_from_dwh", lambda cids: {
+        "blank": {"agent_id": None, "submit_time": None},
+        "other": {"agent_id": "dwh801", "submit_time": "2026-06-01 09:00:00"},
+    })
+    db = _FakeDb([
+        ("blank", None, "2026-10-20 12:32:26"),
+        ("other", None, "2026-10-21 08:00:00"),
+    ])
+    index = crud.cashline_agent_index(db)
+    assert index["blank"] == {"agent_id": None, "submit_time": "2026-10-20 12:32:26"}
+    assert index["other"] == {"agent_id": "dwh801", "submit_time": "2026-10-21 08:00:00"}
+
+
 def test_dwh_failure_leaves_entry_unknown_instead_of_raising(monkeypatch):
     monkeypatch.setattr(crud.data_dwh, "fetch_bundle", lambda cid: (_ for _ in ()).throw(RuntimeError("DWH down")))
     db = _FakeDb([("noAgent", None, None)])
