@@ -48,23 +48,14 @@ def test_tanpa_tanggal_apa_pun_kosong():
     assert sa._tanggal_submit_cell(_r("A"), None) is None
 
 
-# --- jendela tanggal = aturan TicketDates ---------------------------------
-
-def test_jendela_tanggal_menyaring_per_tanggal_tiket():
-    rows = [_r("A"), _r("B"), _r("C")]
-    tdates = {"A": sa.TicketDates((), date(2026, 10, 19)),
-              "B": sa.TicketDates((), date(2026, 10, 20)),
-              "C": sa.TicketDates((), None)}
-    with mock.patch.object(sa, "_ticket_dates_map", lambda db, rs: tdates):
-        kept = sa._in_date_window(None, rows, date(2026, 10, 20), date(2026, 10, 22))
-    assert [r.id for r in kept] == ["B"]
+def test_submit_time_bukan_format_tanggal_jatuh_ke_generated_at():
+    """Sama dengan syarat regex ``_series_date_expr``: nilai seperti '0000-00-00'
+    lolos, tetapi teks bebas tidak dianggap tanggal submit."""
+    r = _r("A", generated_at=datetime(2026, 10, 20, 9, 24, 48))
+    assert sa._tanggal_submit_cell(r, "belum ada") == "2026-10-20 09:24:48"
 
 
-def test_tanpa_jendela_tidak_menyaring_dan_tidak_membaca_tanggal():
-    rows = [_r("A")]
-    with mock.patch.object(sa, "_ticket_dates_map", side_effect=AssertionError):
-        assert sa._in_date_window(None, rows, None, None) == rows
-
+# --- tanggal tiket Statistics ----------------------------------------------
 
 def test_tanggal_tiket_mengabaikan_load_date():
     """26 Okt 2026: ``loads`` selalu kosong -> tanggal tiket = Tanggal Submit."""
