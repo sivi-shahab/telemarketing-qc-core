@@ -43,7 +43,7 @@ where = ["src"]
 # gagal di-import saat runtime.
 # assets/*.png (logo) dan assets/*.jpg (raster template deck) dibaca
 # ppt_error_rate.py lewat __file__ juga.
-"qc_core.compliance" = ["*.json", "*.xlsx", "assets/*.png", "assets/*.jpg"]
+"qc_core.compliance" = ["*.json", "*.xlsx", "assets/*.png", "assets/*.jpg", "ntb_source_data/*.csv", "ntb_source_data/microsite/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

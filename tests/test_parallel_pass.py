@@ -558,3 +558,64 @@ def test_sc_cl_43_sesuai_di_utama_tidak_ditimpa_tanpa_pemicu():
         [_mus("SC_CL_17", _PENJ, "SESUAI", "U"), _mus("SC_CL_43", _FK, "SESUAI", "U")],
         [_mus("SC_CL_17", _PENJ, "SESUAI", "P"), _mus("SC_CL_43", _FK, "BELUM_SESUAI", "P")])
     assert b["SC_CL_43"]["reason"] == "SC_CL_43 U"
+
+
+def _ntb(main, supp="NOT_STATED", mus="NOT_STATED", elig="NOT_REACHED"):
+    return {
+        "ntb_interest": {"status": main}, "ntb_supplement_interest": {"status": supp},
+        "ntb_mus_interest": {"status": mus}, "ntb_mus_eligibility": {"status": elig},
+        "scorecard_result": [],
+    }
+
+
+def test_ntb_minat_memakai_keputusan_terakhir_pelanggan():
+    # tiket 101219aXMP: utama menolak, rekaman penutup mengiyakan
+    evs = [_ntb("NOT_INTERESTED", supp="NOT_INTERESTED", mus="NOT_INTERESTED"),
+           _ntb("NOT_STATED"),  # panggilan dokumen: tidak membahas penawaran
+           _ntb("INTERESTED")]
+    ts = [datetime(2026, 9, 10), datetime(2026, 9, 15, 12), datetime(2026, 9, 15, 18)]
+    out, _r, _c = pp.merge_parallel(evs, ["a", "b", "c"], ts, 0)
+    assert out["ntb_interest"]["status"] == "INTERESTED"
+    assert out["ntb_supplement_interest"]["status"] == "NOT_INTERESTED"  # hanya utama yang konklusif
+    assert out["ntb_mus_interest"]["status"] == "NOT_INTERESTED"
+    assert [j["blok"] for j in out["ntb_interest_pass"]] == ["ntb_interest"]
+    assert out["ntb_interest_pass"][0]["sumber_file"] == "c"
+
+
+def test_ntb_minat_kata_terakhir_juga_berlaku_untuk_penarikan():
+    evs = [_ntb("INTERESTED"), _ntb("NOT_INTERESTED")]
+    out, _r, _c = pp.merge_parallel(evs, ["a", "b"], [datetime(2026, 9, 10), datetime(2026, 9, 15)], 0)
+    assert out["ntb_interest"]["status"] == "NOT_INTERESTED"
+
+
+def test_ntb_minat_utama_dipertahankan_bila_rekaman_lain_tidak_konklusif():
+    evs = [_ntb("INTERESTED"), _ntb("NOT_STATED")]
+    out, _r, _c = pp.merge_parallel(evs, ["a", "b"], [datetime(2026, 9, 10), datetime(2026, 9, 15)], 0)
+    assert out["ntb_interest"]["status"] == "INTERESTED" and "ntb_interest_pass" not in out
+
+
+def test_cashline_tidak_terpengaruh_minat_terbaru():
+    evs = [{"cashline_interest": {"status": "NOT_INTERESTED"}, "scorecard_result": []},
+           {"cashline_interest": {"status": "INTERESTED"}, "scorecard_result": []}]
+    out, _r, _c = pp.merge_parallel(evs, ["a", "b"], [datetime(2026, 9, 10), datetime(2026, 9, 15)], 0)
+    assert out["cashline_interest"]["status"] == "NOT_INTERESTED" and "ntb_interest_pass" not in out
+
+
+def test_ntb_ekstraksi_terbaru_menang_per_field_seperti_cashline():
+    def ev(**ext):
+        return {"ntb_application_extraction": ext, "scorecard_result": []}
+    evs = [ev(no_ktp="3171", email=None, pekerjaan="Karyawan"),
+           ev(no_ktp="9999", email="a@b.com", pekerjaan=""),   # no_ktp: terbaru yang berisi menang
+           ev(email="c@d.com", handphone="0812")]              # email: yang terbaru menang
+    ts = [datetime(2026, 9, 10), datetime(2026, 9, 12), datetime(2026, 9, 15)]
+    out, _r, _c = pp.merge_parallel(evs, ["a", "b", "c"], ts, 0)
+    e = out["ntb_application_extraction"]
+    assert e["no_ktp"] == "9999" and e["pekerjaan"] == "Karyawan"  # pekerjaan: hanya utama yang punya
+    assert e["email"] == "c@d.com" and e["handphone"] == "0812"
+    assert {j["field"] for j in out["ntb_extraction_pass"]} == {"no_ktp", "email", "handphone"}
+
+
+def test_ntb_ekstraksi_cashline_tidak_terpengaruh():
+    evs = [{"scorecard_result": []}, {"scorecard_result": []}]
+    out, _r, _c = pp.merge_parallel(evs, ["a", "b"], [datetime(2026, 9, 10), datetime(2026, 9, 15)], 0)
+    assert "ntb_application_extraction" not in out and "ntb_extraction_pass" not in out

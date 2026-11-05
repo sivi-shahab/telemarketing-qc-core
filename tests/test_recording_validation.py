@@ -102,7 +102,7 @@ def _lap(nama, jam, *, durasi=1200.0, segmen=120, penutup=True, ok=True, teks=No
 def _jalankan(monkeypatch, laporan):
     """Jalankan ``pilih_recording_utama`` atas laporan buatan (PDF tidak disentuh)."""
     peta = {r["path"]: r for r in laporan}
-    monkeypatch.setattr(RV, "periksa_berkas", lambda p, t=None: peta[p])
+    monkeypatch.setattr(RV, "periksa_berkas", lambda p, t=None, produk=None: peta[p])
     return RV.pilih_recording_utama([r["path"] for r in laporan], expected_ticket_id="T1")
 
 
@@ -203,3 +203,28 @@ def test_tags_by_file_menandai_utama_dan_buangan():
     assert peta["u.pdf"]["tag"] == "recording_utama"
     assert peta["p.pdf"]["tag"] == "recording_perbaikan"   # pendamping, bukan utama
     assert peta["x.pdf"]["tag"] == TAG_DITUNDA and peta["x.pdf"]["reason"] == "sebab"
+
+
+# --- alasan rekaman yang dinilai (kolom Call Duration) --------------------------
+
+def test_alasan_dipakai_utama_dan_pendamping():
+    hasil = {
+        "utama": "/t/T1_20260910100000.pdf", "pendamping": ["/t/T1_20260915100000.pdf"],
+        "dibuang": [], "fallback": None,
+        "laporan": [
+            {"filename": "T1_20260910100000.pdf", "durasi": 1227, "n_segmen": 212},
+            {"filename": "T1_20260915100000.pdf", "durasi": 830, "n_segmen": 202},
+        ],
+    }
+    a = RV.alasan_dipakai(hasil)
+    assert "rekaman utama" in a["T1_20260910100000.pdf"] and "20m 27s" in a["T1_20260910100000.pdf"]
+    assert "pendamping" in a["T1_20260915100000.pdf"]
+
+
+def test_alasan_dipakai_satu_rekaman_dan_fallback():
+    satu = RV.alasan_dipakai({"utama": "/t/T1_1.pdf", "pendamping": [], "fallback": "tiket satu rekaman"})
+    assert satu == {"T1_1.pdf": "Satu-satunya rekaman pada tiket ini."}
+    fb = RV.alasan_dipakai({"utama": "/t/T1_1.pdf", "pendamping": ["/t/T1_2.pdf"],
+                            "fallback": "tidak ada rekaman yang lolos validasi", "laporan": []})
+    assert "jaring pengaman" in fb["T1_2.pdf"] and "tidak ada rekaman yang lolos" in fb["T1_1.pdf"].lower()
+    assert RV.alasan_dipakai({"utama": None}) == {}
