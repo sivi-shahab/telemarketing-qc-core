@@ -804,7 +804,7 @@ def test_ntb_ktp_age_boundaries():
 def test_ntb_ktp_lama_nik_bukan_16_digit_ditolak():
     from qc_core.compliance.ntb_ktp import ntb_old_ktp_rejection
 
-    ktp = lambda nik: {"verifications": [{"field": "NIK", "document": nik}, {"field": "Kewarganegaraan", "document": "WNI"}]}
+    ktp = lambda nik: {"nik": nik, "kewarganegaraan": "WNI"}  # nilai KTP Microsite
     assert ntb_old_ktp_rejection(ktp("3171234567890123")) is None            # e-KTP, 16 digit
     assert ntb_old_ktp_rejection(ktp("3171 2345 6789 0123")) is None        # pemisah diabaikan
     r = ntb_old_ktp_rejection(ktp("317123456789012"))                         # 15 digit
@@ -883,12 +883,6 @@ def test_nama_ktp_tiga_arah_ocr_tms_transkrip():
     assert baris("BUDI SANTOSO", None, None)["match"] == "SKIPPED_NULL"
 
 
-def test_ktp_ocr_name_ambil_ktp_terakhir_yang_terbaca():
-    from qc_core.compliance.ntb_verification import ktp_ocr_name
-    docs = [("kk", {"nama_ktp": "X"}), ("ktp", {"nama_ktp": "A"}), ("ktp", {"verifications": []}), ("ktp", {"nama_ktp": " B "})]
-    assert ktp_ocr_name(docs) == "B" and ktp_ocr_name([("ktp", {})]) is None
-
-
 def test_handphone_nasabah_tidak_boleh_sama_dengan_keluarga_dekat():
     def baris(tms, ucap_keluarga=None):
         ev = _ev()
@@ -901,31 +895,36 @@ def test_handphone_nasabah_tidak_boleh_sama_dengan_keluarga_dekat():
     assert r["match"] == "SKIPPED_NULL" and any("keluarga dekat" in t for t in r["thresholds"])
 
 
-def test_microsite_csv_per_field_voting_dua_sumber_sepakat(tmp_path, monkeypatch):
+def test_microsite_ktp_voting_dua_sumber_sepakat():
     from qc_core.compliance import ntb_verification as nv
-    (tmp_path / "tempat-lahir.csv").write_text("ticket_id,value\nT1,Bandung\nT2,Bogor\n", encoding="utf-8")
-    monkeypatch.setattr(nv, "MICROSITE_DIR", str(tmp_path))
 
-    def baris(ticket, tms, ucap):
+    def baris(micro, tms, ucap):
         ev = _ev()
         ev["ntb_application_extraction"] = {"tempat_lahir": ucap}
-        row = {"result_id": ticket, "tempat-lahir": tms}
-        return next(x for x in nv.build_ntb_data_verification(ev, row) if x["item_code"] == "SC_NTB_14")
-    r = baris("T1", "Bandung", "Jakarta")  # TMS = Microsite, transkrip beda -> 2 sumber sepakat
+        ktp = {"tempat_lahir": micro} if micro else {}
+        return next(x for x in nv.build_ntb_data_verification(ev, {"tempat-lahir": tms}, ktp) if x["item_code"] == "SC_NTB_14")
+    r = baris("Bandung", "Bandung", "Jakarta")  # TMS = Microsite, transkrip beda -> 2 sumber sepakat
     assert r["match"] == "MATCH" and r["source_value"] == "Bandung" and any("Voting" in t for t in r["thresholds"])
-    assert baris("T1", "Jakarta", "Bandung")["match"] == "MATCH"  # Microsite = transkrip
-    assert baris("T2", "Bandung", "Jakarta")["match"] == "MISMATCH"  # ketiganya beda
-    assert baris("T3", "Bandung", "Jakarta")["match"] == "MISMATCH"  # tanpa Microsite: TMS vs transkrip
-    assert baris("T1", "Bandung", None)["match"] == "MATCH"  # transkrip kosong: Microsite vs TMS saja
+    assert baris("Bandung", "Jakarta", "Bandung")["match"] == "MATCH"  # Microsite = transkrip
+    assert baris("Bogor", "Bandung", "Jakarta")["match"] == "MISMATCH"  # ketiganya beda
+    assert baris(None, "Bandung", "Jakarta")["match"] == "MISMATCH"  # tanpa Microsite: TMS vs transkrip
+    assert baris("Bandung", "Bandung", None)["match"] == "MATCH"  # transkrip kosong: Microsite vs TMS saja
 
 
-def test_ktp_ocr_values_semua_field_ktp_ikut_voting():
+def test_microsite_tanpa_csv_per_field():
     from qc_core.compliance import ntb_verification as nv
-    docs = [("ktp", {"nama_ktp": "A", "tempat_lahir": "Bandung", "jenis_kelamin": "LAKI-LAKI", "status_perkawinan_ktp": "KAWIN",
-                     "verifications": [{"field": "NIK", "document": "3201010101900001"}, {"field": "Kewarganegaraan", "document": "WNI"}]})]
-    k = nv.ktp_ocr_values(docs)
-    assert k["nama"] == "A" and k["nik"] == "3201010101900001" and k["kewarganegaraan"] == "WNI" and k["tempat_lahir"] == "Bandung"
-    assert nv.ktp_ocr_name(docs) == "A" and nv.ktp_ocr_values([("ktp", {})]) == {}
+    assert not hasattr(nv, "microsite_value") and not hasattr(nv, "MICROSITE_DIR")
+    assert not hasattr(nv, "ktp_ocr_values")
+
+
+def test_microsite_ktp_values_semua_field_ktp_ikut_voting():
+    from qc_core.compliance import ntb_verification as nv
+    from qc_core.services.microsite import ktp_values
+    k = ktp_values({"NIK": "3201010101900001", "NAMA": "A", "TTL": "BANDUNG, 01-02-1990", "JENIS_KELAMIN": "LAKI-LAKI",
+                    "STATUS_PERKAWINAN": "KAWIN", "KEWARGANEGARAAN": "WNI", "RT_RW": "005/006", "GOL_DARAH": "-", "AGAMA": ""})
+    assert k["nama"] == "A" and k["nik"] == "3201010101900001" and k["kewarganegaraan"] == "WNI" and k["tempat_lahir"] == "BANDUNG"
+    assert k["tanggal_lahir"] == "1990-02-01" and k["rt"] == "005" and k["rw"] == "006" and "agama" not in k
+    assert ktp_values({}) == {} and ktp_values(None) == {}
 
     def baris(code, tms, ucap_key, ucap, ktp):
         ev = _ev()
@@ -950,15 +949,12 @@ def test_alamat_rumah_voting_dengan_ktp():
     assert r["match"] == "MISMATCH"
 
 
-def test_supplement_microsite_voting_jenis_kelamin(tmp_path, monkeypatch):
+def test_supplement_tanpa_microsite_tms_vs_transkrip():
     from qc_core.compliance import ntb_verification as nv
-    (tmp_path / "jenis-kelamin-1-new.csv").write_text("ticket_id,value\nT1,Perempuan\n", encoding="utf-8")
-    monkeypatch.setattr(nv, "MICROSITE_DIR", str(tmp_path))
 
-    def baris(ticket, ucap):
+    def baris(ucap):
         ev = _ev()
         ev["ntb_application_extraction"] = {"kartu_tambahan": [{"nama": "Novia", "jenis_kelamin": ucap, "hubungan": "istri saya"}]}
-        return _supl_rows(ev, _supl_tms(**{"result_id": ticket}))["kartu_tambahan_1_jenis_kelamin"]
-    r = baris("T1", "Laki-laki")  # TMS = Microsite, transkrip beda -> 2 sumber sepakat
-    assert r["match"] == "MATCH" and r["source_value"] == "Perempuan" and any("Voting" in t for t in r["thresholds"])
-    assert baris("T2", "Laki-laki")["match"] == "MISMATCH" and baris("T2", "Laki-laki")["source_value"] is None
+        return _supl_rows(ev, _supl_tms(**{"result_id": "T1"}))["kartu_tambahan_1_jenis_kelamin"]
+    r = baris("Laki-laki")  # TMS Perempuan vs transkrip Laki-laki, tanpa sumber ketiga
+    assert r["match"] == "MISMATCH" and r["source_value"] is None
