@@ -1,0 +1,26 @@
+campaign,value,keterangan
+Supplement,TFSCFC0000,
+Supplement,TWIREG0000,
+Supplement,TSCCFC000000,
+Supplement,TWIREG0001,
+CashLine Non Bank,TWICLRFCPYR000,Agent pilih; Payroll or Cashline NTB
+CashLine Non Bank,TWICATRFC0000,Agent pilih; Payroll or Cashline NTB
+CashLine NTB,TPLCFC0004,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+CashLine NTB,TPLCFC0005,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+CashLine NTB,TPLCFC0006,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+CashLine NTB,TPLCFC0007,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+CashLine NTB,TPLCFC0008,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+CashLine NTB,TPLCFC0009,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+CashLine NTB,TPLCFC0010,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+CashLine NTB,TPLCFC0011,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+CashLine NTB,TPLCFC0012,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+CashLine NTB,TWICATCFC0000,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+CashLine NTB,TWICATRFC0000,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+CashLine NTB,ICTLREGCLHT0000,Sourcecode otomatis bedasarkan segmen nasabah (ditentukan leads saat upload)
+New To Bank Eksternal,TPIREGRFCNET,Pengajuan Basic Only
+New To Bank Eksternal,TPIBDLREGNET,Pengajuan Basic Bundling Supplement (dipisahkan untuk kebutuhan Program Cashback Supl; program sudah berakhir)
+Reinstate,TRTREG0002,Reinstate Basic Only
+Supplement Activation,TWISUCFC00000,
+Supplement Activation,TFSCFC0000,
+Supplement Activation,TWIREG0000,
+Supplement Activation,TSCCFC000000,
