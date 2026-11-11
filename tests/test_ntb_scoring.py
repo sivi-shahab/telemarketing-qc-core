@@ -104,7 +104,7 @@ from qc_core.compliance.ntb_verification import (
 
 def test_ntb_fields_map_to_unique_sc_items():
     codes = [c for *_x, c in NTB_FIELDS if c]  # "Lama bekerja" = SC_NTB_76 (hanya ada di scorecard v2)
-    assert len(codes) == len(set(codes)) == 26
+    assert len(codes) == len(set(codes)) == 27
     assert codes[0] == "SC_NTB_8" and "SC_NTB_76" in codes
 
 
@@ -121,7 +121,7 @@ def test_data_verification_links_tms_transcript_and_sc_status():
 
 def test_data_verification_without_tms_row_still_lists_fields():
     rows = build_ntb_data_verification(_ev(), None)
-    assert len(rows) == 26 and all(r["tms_value"] is None for r in rows)
+    assert len(rows) == 27 and all(r["tms_value"] is None for r in rows)
 
 
 def test_campaign_interest_labels():
@@ -521,30 +521,44 @@ def test_campaign_interest_verification_tiga_baris_dan_tidak_di_tabel_data():
     assert all(r["match"] == "SKIPPED_NULL" for r in build_ntb_campaign_interest_verification(ev, None))
 
 
-def test_persetujuan_sharing_data_dicek_dari_microsite_belum_dinilai():
-    # Persetujuan sharing data ke mitra dicek dari Microsite (menunggu contoh), bukan dari transkrip atau kecocokan TMS "Y".
-    from qc_core.compliance.ntb_verification import apply_persetujuan_data_belum_dinilai, apply_verification_verdicts
-    assert compare_field("persetujuan-data-nasabah", "Y", "SETUJU")[0] == "SKIPPED_NULL"
-    assert compare_field("persetujuan-data-nasabah", "Y", None)[0] == "SKIPPED_NULL"
-    ev = _ev(items=[_item("SC_NTB_40", 1, "BELUM_SESUAI", "NO")])
-    ev["ntb_application_extraction"] = {"persetujuan_sharing_data": "SETUJU"}
-    tms = {"persetujuan-data-nasabah": "Y"}
-    row = {x["field"]: x for x in build_ntb_data_verification(ev, tms)}["persetujuan_sharing_data"]
-    assert row["match"] == "SKIPPED_NULL" and row["tms_value"] == "Y" and row["extracted_value"] is None
-    assert any("Microsite" in x for x in row["thresholds"])
-    ev = apply_persetujuan_data_belum_dinilai(apply_verification_verdicts(ev, tms), tms)
-    assert ev["scorecard_result"][0]["status"] == "TIDAK_DINILAI"  # tanpa potongan skor dan tanpa veto
-    assert scoring.scorecard_score(ev) == 100 and scoring.has_blocking_intolerable_item(ev) is False
+def test_pdp_dicek_ke_kolom_tms_persetujuan_data_nasabah():
+    # SC_40 hanya cek TMS (Y/1 = SESUAI). SC_46: TMS Y/1 -> status transkrip dibiarkan. Selain itu keduanya BELUM_SESUAI (bom PDP).
+    from qc_core.compliance.ntb_verification import apply_pdp_tms_gate, apply_verification_verdicts
+    assert compare_field("persetujuan-data-nasabah", "Y", None)[0] == "MATCH"
+    assert compare_field("persetujuan-data-nasabah", "1", "TIDAK_SETUJU")[0] == "MATCH"
+    assert compare_field("persetujuan-data-nasabah", "N", "SETUJU")[0] == "MISMATCH"
+    for setuju in ("Y", "y", " 1 "):
+        tms = {"persetujuan-data-nasabah": setuju}
+        ev = _ev(items=[_item("SC_NTB_40", 1, "TIDAK_DINILAI", "NO"), _item("SC_NTB_46", 5, "BELUM_SESUAI", "NO")])
+        ev = apply_pdp_tms_gate(apply_verification_verdicts(ev, tms), tms)
+        assert [i["status"] for i in ev["scorecard_result"]] == ["SESUAI", "BELUM_SESUAI"]  # SC_46 tetap status transkrip
+    for tidak in ("N", "0", "", None):
+        tms = {"persetujuan-data-nasabah": tidak}
+        ev = _ev(items=[_item("SC_NTB_40", 1, "SESUAI", "NO"), _item("SC_NTB_46", 5, "SESUAI", "NO"), _item("SC_NTB_5", 1, "SESUAI", "NO")])
+        ev = apply_pdp_tms_gate(apply_verification_verdicts(ev, tms), tms)
+        assert [i["status"] for i in ev["scorecard_result"]] == ["BELUM_SESUAI", "BELUM_SESUAI", "SESUAI"]
+        assert scoring.non_tolerable_bomb(ev) == -25.0 and scoring.has_blocking_intolerable_item(ev) is True
+    ev = _ev(items=[_item("SC_NTB_40", 1, "SESUAI", "NO")])
+    assert apply_pdp_tms_gate(ev, None)["scorecard_result"][0]["status"] == "SESUAI"  # tanpa baris TMS: tidak berbuat apa-apa
 
 
-def test_pdp_supplement_dari_microsite_belum_dinilai_tanpa_bom():
-    from qc_core.compliance.ntb_verification import apply_pdp_supplement_belum_dinilai
-    ev = _ev(items=[_item("SC_NTB_46", 5, "BELUM_SESUAI", "NO")])
-    assert scoring.non_tolerable_bomb(ev) == -25.0
-    ev = apply_pdp_supplement_belum_dinilai(ev)
-    assert ev["scorecard_result"][0]["status"] == "TIDAK_DINILAI"
-    assert scoring.non_tolerable_bomb(ev) == 0.0 and scoring.has_blocking_intolerable_item(ev) is False
-    assert apply_pdp_supplement_belum_dinilai(_ev(items=[_item("SC_NTB_5", 1, "BELUM_SESUAI", "NO")]))["scorecard_result"][0]["status"] == "BELUM_SESUAI"
+def test_consent_nasabah_tidak_wajib_setuju_atau_tolak_sama_saja():
+    # SC_NTB_77 (sharing data untuk penawaran lain): TMS consent-nasabah 1/0 hanya ditampilkan; status dari transkrip, bobot 0.
+    from qc_core.compliance.ntb_verification import apply_pdp_tms_gate, apply_verification_verdicts
+    assert compare_field("consent-nasabah", "1", None)[0] == "MATCH"
+    assert compare_field("consent-nasabah", "0", "SETUJU")[0] == "MATCH"
+    assert compare_field("consent-nasabah", None, "SETUJU")[0] == "SKIPPED_NULL"
+    for consent in ("1", "0"):
+        for ps in ("Y", "N"):
+            tms = {"consent-nasabah": consent, "persetujuan-data-nasabah": ps}
+            for status in ("SESUAI", "BELUM_SESUAI"):
+                ev = _ev(items=[_item("SC_NTB_77", 0, status, "YES")])
+                ev = apply_pdp_tms_gate(apply_verification_verdicts(ev, tms), tms)
+                assert ev["scorecard_result"][0]["status"] == status  # tidak ditimpa nilai TMS apa pun
+    ev = _ev(items=[_item("SC_NTB_77", 0, "BELUM_SESUAI", "YES")])
+    assert scoring.has_blocking_intolerable_item(ev) is False and scoring.non_tolerable_bomb(ev) == 0.0
+    row = {x["field"]: x for x in build_ntb_data_verification(_ev(), {"consent-nasabah": "0"})}["persetujuan_sharing_data"]
+    assert row["item_code"] == "SC_NTB_77" and row["tms_value"] == "0" and row["tms_column"] == "consent-nasabah"
 
 
 def test_jenis_kartu_dibandingkan_bila_disebut_selain_itu_tms_valid():

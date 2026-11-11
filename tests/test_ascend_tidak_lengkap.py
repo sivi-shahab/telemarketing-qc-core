@@ -82,3 +82,45 @@ def test_alias_hanya_menaikkan_nilai():
 
 def test_acuan_tanpa_alias_tidak_berubah():
     assert best_alias_part("ENOK", "Enok") is None
+
+
+# --- Round-up ke ambang MATCH (9 Nov 2026) ----------------------------------
+from qc_core.compliance.static_similarity import roundup_to_threshold
+
+
+@pytest.mark.parametrize("score, threshold, expected", [
+    (78.0, 80.0, 80.0),
+    (79.0, 80.0, 80.0),
+    (77.0, 80.0, 77.0),     # di luar jendela
+    (80.0, 80.0, 80.0),
+    (88.0, 90.0, 90.0),     # ambang dinamis (aturan lama nama ibu)
+    (87.0, 90.0, 87.0),
+    (None, 80.0, None),
+])
+def test_roundup_to_threshold(score, threshold, expected):
+    assert roundup_to_threshold(score, threshold) == expected
+
+
+def _eval(ref, ucapan, llm_sim=70):
+    return {"static_rules_version": 2, "card_holder_verification": [{
+        "field": "nama_ibu_kandung", "reference_value": ref, "extracted_value": ucapan,
+        "extracted_mentions": [{"timestamp": "00:01.00", "value": ucapan}],
+        "similarity_percent": llm_sim, "match": "MISMATCH", "reason": "x"}]}
+
+
+def test_normalize_membulatkan_78_ke_80_dan_mencatat_asalnya():
+    from qc_core.compliance.error_codes import normalize_static_verification
+    # "sumarni" vs "sumarno": 1 substitusi dari 7 huruf = 85,7 -> pakai pasangan 78,x di bawah
+    ref, ucapan = "ABCDEFGHI", "ABCDEFGHX"   # 8/9 = 88,9 (bukan kasus); cari pasangan 78-79 langsung
+    from qc_core.compliance.static_similarity import similarity_nama_ibu
+    for a, b in [("ABCDEFGHI", "ABCDEFXYI"), ("ABCDEFGHIJ", "ABCDEFGXYZ"), ("ABCDEFGHIJKLM", "ABCDEFGHIJXYZ")]:
+        if similarity_nama_ibu(a, b) in (78.0, 79.0):
+            ref, ucapan = a, b
+            break
+    raw = similarity_nama_ibu(ref, ucapan)
+    assert raw in (78.0, 79.0)
+    row = normalize_static_verification(_eval(ref, ucapan))["card_holder_verification"][0]
+    assert row["similarity_percent"] == 80.0
+    assert row["similarity_roundup_from"] == raw
+    assert row["match"] == "MATCH"
+    assert "dibulatkan" in row["reason"]
