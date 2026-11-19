@@ -128,24 +128,79 @@ def test_dwh_only_fills_gaps_never_erases_snapshot_submit_time(monkeypatch):
 
 
 def test_dwh_failure_leaves_entry_unknown_instead_of_raising(monkeypatch):
-    monkeypatch.setattr(crud.data_dwh, "fetch_bundle", lambda cid: (_ for _ in ()).throw(RuntimeError("DWH down")))
+    monkeypatch.setattr(crud.data_dwh, "fetch_bundle_checked", lambda cid: (_ for _ in ()).throw(RuntimeError("DWH down")))
     db = _FakeDb([("noAgent", None, None)])
     assert crud.cashline_agent_index(db) == {"noAgent": {"agent_id": None, "submit_time": None}}
 
 
 def test_empty_dwh_result_is_not_memoised(monkeypatch):
-    """A blank answer may just mean the DWH row has not landed yet — caching it
-    would pin the ticket to "(Tidak diketahui)" until the process restarts."""
-    monkeypatch.setattr(crud.data_dwh, "fetch_bundle", lambda cid: {"cashline": None})
+    """A blank, UNCONFIRMED answer (DWH error/timeout) may just mean the row has not
+    landed yet — caching it would pin the ticket to "(Tidak diketahui)" until the
+    process restarts. (Confirmed-absent answers get the short negative memo below.)"""
+    monkeypatch.setattr(crud.data_dwh, "fetch_bundle_checked", lambda cid: ({"cashline": None}, False))
     crud._cashline_ids_from_dwh(["noAgent"])
     assert "noAgent" not in crud._CASHLINE_ID_MEMO
 
     monkeypatch.setattr(
-        crud.data_dwh, "fetch_bundle",
-        lambda cid: {"cashline": {"agent_id": "late801", "submit_time": "2026-06-01 09:00:00"}},
+        crud.data_dwh, "fetch_bundle_checked",
+        lambda cid: ({"cashline": {"agent_id": "late801", "submit_time": "2026-06-01 09:00:00"}}, True),
     )
     assert crud._cashline_ids_from_dwh(["noAgent"])["noAgent"]["agent_id"] == "late801"
     assert crud._CASHLINE_ID_MEMO["noAgent"]["agent_id"] == "late801", "positive result must be memoised"
+
+
+# --------------------------------------------------------------------------
+# Memo NEGATIF berumur pendek (19 Nov 2026): refresh Statistics jalan tiap beberapa
+# menit dan worker stats tidak membaca Redis, jadi ~700 id yang memang tidak ada di
+# DWH (404 di kedua endpoint) di-probe ulang tiap refresh (~64 dtk). Hanya jawaban
+# "PASTI tidak ada" yang ditahan, dan hanya selama _CASHLINE_ID_NEG_TTL_SEC.
+# --------------------------------------------------------------------------
+
+_ABSENT = {"cashline": None, "customer": None}
+
+
+def _count_checked(monkeypatch, bundle, pasti):
+    calls = []
+
+    def _fake(cid):
+        calls.append(cid)
+        return dict(bundle), pasti
+
+    monkeypatch.setattr(crud.data_dwh, "fetch_bundle_checked", _fake)
+    return calls
+
+
+def test_confirmed_absent_ids_are_not_probed_again_within_ttl(monkeypatch):
+    calls = _count_checked(monkeypatch, _ABSENT, True)
+    cids = [f"gone{i}" for i in range(5)]
+
+    first = crud._cashline_ids_from_dwh(cids)
+    second = crud._cashline_ids_from_dwh(cids)
+
+    assert len(calls) == 5, "second pass must be served from the negative memo"
+    unknown = {"agent_id": None, "submit_time": None}
+    assert first == second == {c: unknown for c in cids}
+
+
+def test_unconfirmed_dwh_failure_is_probed_again(monkeypatch):
+    """pasti=False = DWH down/timeout: NOT proof the row is absent, so no negative memo."""
+    calls = _count_checked(monkeypatch, _ABSENT, False)
+    crud._cashline_ids_from_dwh(["flaky"])
+    crud._cashline_ids_from_dwh(["flaky"])
+    assert calls == ["flaky", "flaky"]
+
+
+def test_negative_memo_expires_and_a_late_row_is_then_picked_up(monkeypatch):
+    calls = _count_checked(monkeypatch, _ABSENT, True)
+    crud._cashline_ids_from_dwh(["late"])
+    monkeypatch.setattr(crud, "_CASHLINE_ID_NEG_TTL_SEC", 0.0)  # entry now expired
+
+    found = {"cashline": {"agent_id": "late801", "submit_time": "2026-11-19 09:00:00"}}
+    monkeypatch.setattr(crud.data_dwh, "fetch_bundle_checked", lambda cid: (found, True))
+
+    assert crud._cashline_ids_from_dwh(["late"])["late"]["agent_id"] == "late801"
+    assert len(calls) == 1
+    assert crud._CASHLINE_ID_MEMO["late"]["agent_id"] == "late801"
 
 
 # --------------------------------------------------------------------------
@@ -164,3 +219,12 @@ def test_customer_ids_for_agent_ids_matches_case_insensitively(no_dwh):
 def test_customer_ids_for_agent_ids_empty_input_skips_all_work():
     assert crud.customer_ids_for_agent_ids(_FakeDb([]), []) == []
     assert crud.customer_ids_for_agent_ids(_FakeDb([]), None) == []
+
+
+def test_existing_row_with_blank_agent_is_not_negatively_memoised(monkeypatch):
+    """Only 'no cashline row at all' is negative-cached; a row whose agent_id is
+    still blank may be filled in later and must stay retryable."""
+    calls = _count_checked(monkeypatch, {"cashline": {"agent_id": "", "submit_time": ""}, "customer": None}, True)
+    crud._cashline_ids_from_dwh(["blank"])
+    crud._cashline_ids_from_dwh(["blank"])
+    assert calls == ["blank", "blank"]
